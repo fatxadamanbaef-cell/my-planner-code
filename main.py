@@ -6,7 +6,7 @@ import httpx
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, Update
+from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton
 from openai import AsyncOpenAI
 
 # Ключи Telegram и Supabase
@@ -27,8 +27,17 @@ def get_now_tashkent():
     """Возвращает точное время в Ташкенте (UTC+5)"""
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=5)
 
+def get_main_keyboard():
+    """Создает удобную постоянную клавиатуру пульта управления"""
+    kb = [
+        [KeyboardButton(text="📉 Показать расходы"), KeyboardButton(text="🪙 Показать доходы")],
+        [KeyboardButton(text="🎓 Баланс учеников"), KeyboardButton(text="📊 Полный отчёт")],
+        [KeyboardButton(text="📅 Расписание"), KeyboardButton(text="🔔 Напоминания")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
 SYSTEM_PROMPT = """
-Ты — первый этап ультимативного ИИ-ассистент. Твоя задача — строго определить намерение пользователя и извлечь параметры в JSON.
+Ты — первый этап ультимативного ИИ-ассистента. Твоя задача — строго определить намерение пользователя и извлечь параметры в JSON.
 
 Варианты намерения (intent):
 - 'insert_expense' / 'insert_income' (Запись нового расхода или дохода)
@@ -37,7 +46,7 @@ SYSTEM_PROMPT = """
 - 'insert_reminder' (Установка напоминания на точное время)
 - 'insert_student_pay' / 'insert_student_lesson' / 'set_student_balance' (Управление балансом студентов)
 - 'complete_task' (Отметить задачу как выполненную)
-- 'delete_finance' (СТРОГО если пользователь просит ОЧИСТИТЬ, УДАЛИТЬ, СТЕРЕТЬ свои расходы или доходы, начать заново. Например: "очисти расходы за сегодня", "удали траты за 17 мая")
+- 'delete_finance' (Очистить или удалить расходы/доходы за день)
 
 - 'read_finance' (Просмотр истории денег, расходов, доходов)
 - 'read_tasks' / 'read_notes' / 'read_students' / 'read_reminders' (Просмотр списков данных)
@@ -78,8 +87,8 @@ async def generate_smart_reply(user_text: str, db_data: list) -> str:
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Ты — ИИ-ассистент топ-преподавателя математики из Ташкента. Проанализируй сырые данные из базы Supabase и развернуто ответь на вопрос пользователя. Используй структуру, эмодзи и Markdown."},
-                {"role": "user", "content": f"Вопрос: \"{user_text}\"\n\nДанные:\n{json.dumps(db_data, ensure_ascii=False, indent=2)}"}
+                {"role": "system", "content": "Ты — ИИ-ассистент топ-преподавателя математики из Ташкента. Проанализируй сырые данные из базы Supabase и развернуто ответь на вопрос пользователя. Считай суммы, группируй информацию, делай экспертные выводы. Используй красивую структуру, эмодзи и Markdown."},
+                {"role": "user", "content": f"Вопрос: \"{user_text}\"\n\nДанные из базы:\n{json.dumps(db_data, ensure_ascii=False, indent=2)}"}
             ]
         )
         return response.choices[0].message.content
@@ -113,14 +122,11 @@ async def process_intent(ai_data: dict, chat_id: int, original_text: str) -> str
 
     async with httpx.AsyncClient() as client:
         try:
-            # === ФИЧА: ОЧИСТКА И УДАЛЕНИЕ ФИНАНСОВ ===
             if intent == "delete_finance":
                 target_date = params.get("date") or get_now_tashkent().strftime("%Y-%m-%d")
                 url = f"{SUPABASE_URL}/rest/v1/finance?chat_id=eq.{chat_id}&date=eq.{target_date}"
                 res = await client.delete(url, headers=headers)
-                if res.status_code in [200, 204]:
-                    return f"🧹 *База очищена!* Все твои финансовые записи за *{target_date}* успешно удалены из облака. Можешь вносить заново!"
-                return "❌ Не удалось очистить данные."
+                return f"🧹 *База очищена!* Все финансовые записи за *{target_date}* удалены." if res.status_code in [200, 204] else "❌ Не удалось очистить."
 
             elif intent == "read_finance":
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/finance?chat_id=eq.{chat_id}", headers=headers)
@@ -209,8 +215,43 @@ async def process_intent(ai_data: dict, chat_id: int, original_text: str) -> str
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Робот обновлен! Теперь я умею очищать расходы по твоей команде.")
+    await message.answer(
+        "🚀 Пульт управления активирован!\n\nИспользуй удобные кнопки главного меню ниже, чтобы мгновенно просматривать отчёты и балансы 👇",
+        reply_markup=get_main_keyboard()
+    )
 
+# ========================================================
+# УМНЫЕ ОБРАБОТЧИКИ НАЖАТИЙ НА КНОПКИ (БЕЗ ЛИШНЕГО ПАРСИНГА)
+# ========================================================
+@dp.message(F.text == "📉 Показать расходы")
+async def btn_expenses(message: Message):
+    await message.answer("🔄 Анализирую расходы...")
+    ai_data = {"intent": "read_finance", "params": {"description": "expense"}}
+    reply = await process_intent(ai_data, message.chat.id, message.text)
+    await message.answer(reply, parse_mode="Markdown")
+
+@dp.message(F.text == "🪙 Показать доходы")
+async def btn_incomes(message: Message):
+    await message.answer("🔄 Анализирую доходы...")
+    ai_data = {"intent": "read_finance", "params": {"description": "income"}}
+    reply = await process_intent(ai_data, message.chat.id, message.text)
+    await message.answer(reply, parse_mode="Markdown")
+
+@dp.message(F.text == "🎓 Баланс учеников")
+async def btn_balances(message: Message):
+    await message.answer("🔄 Проверяю остатки занятий...")
+    ai_data = {"intent": "read_students", "params": {}}
+    reply = await process_intent(ai_data, message.chat.id, "Покажи баланс всех моих учеников и напомни, когда были последние изменения")
+    await message.answer(reply, parse_mode="Markdown")
+
+@dp.message(F.text == "🔔 Напоминания")
+async def btn_reminders(message: Message):
+    await message.answer("🔄 Загружаю активные напоминания...")
+    ai_data = {"intent": "read_reminders", "params": {}}
+    reply = await process_intent(ai_data, message.chat.id, message.text)
+    await message.answer(reply, parse_mode="Markdown")
+
+@dp.message(F.text == "📅 Расписание")
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -222,6 +263,7 @@ async def get_today(message: Message):
         for t in tasks: reply += f"{'🎓' if t['type']=='lesson' else '📌'} {t['description']}\n"
         await message.answer(reply, parse_mode="Markdown")
 
+@dp.message(F.text == "📊 Полный отчёт")
 @dp.message(F.text == "/charts")
 async def get_charts(message: Message):
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
