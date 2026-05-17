@@ -21,6 +21,9 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+# Переменная для отслеживания ежедневного напоминания о расходах
+LAST_EXPENSE_PROMPT_DATE = ""
+
 def get_now_tashkent():
     """Возвращает точное время в Ташкенте (UTC+5)"""
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=5)
@@ -33,12 +36,12 @@ SYSTEM_PROMPT = """
 - 'task' / 'lesson' (добавление новой задачи или нового урока в календарь)
 - 'note' (сохранение новой заметки, мысли или идеи в блокнот)
 - 'reminder' (установка напоминания на конкретное время)
-- 'student_pay' (СТРОГО факт совершившейся оплаты! Когда ученик КУПИЛ, ОПЛАТИЛ занятия. Если фраза в будущем времени "должен оплатить" или вопрос "что там с оплатой" — это НЕ этот тип!)
+- 'student_pay' (СТРОГО факт совершившейся оплаты! Когда ученик КУПИЛ, ОПЛАТИЛ занятия.)
 - 'student_lesson' (списание проведенных уроков)
 - 'student_set_balance' (ручное изменение/исправление баланса ученика)
 - 'get_notes' (запрос на просмотр сохраненных заметок/мыслей)
 - 'get_tasks' (запрос на просмотр списка дел, планов или расписания)
-- 'get_reminders' (если пользователь просит ПОКАЗАТЬ НАПОМИНАНИЯ, вывести список напоминалок)
+- 'get_reminders' (запрос списка активных напоминалок)
 - 'get_balances' (запрос баланса уроков студентов)
 - 'complete_task' (завершение задачи из календаря)
 - 'other' (вежливость, вопросы, рассуждения, не требующие записи в базу)
@@ -92,7 +95,6 @@ async def save_data(data: dict, chat_id: int) -> str:
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
-            # Нормализация имени студента (ЗАЩИТА от дублей: "САХИБ" -> "Сахиб")
             raw_name = data.get("student_name")
             student_name = raw_name.strip().lower().capitalize() if raw_name else None
 
@@ -105,7 +107,6 @@ async def save_data(data: dict, chat_id: int) -> str:
                     return reply
                 return "🎓 Учеников с активным балансом не найдено."
 
-            # === НОВАЯ ЛОГИКА: ВЫВОД НАПОМИНАНИЙ ===
             elif data["type"] == "get_reminders":
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/reminders?chat_id=eq.{chat_id}&status=eq.pending", headers=headers)
                 if res.status_code == 200 and res.json():
@@ -170,7 +171,7 @@ async def save_data(data: dict, chat_id: int) -> str:
                 return "📌 Нет активных задач!"
 
             elif data["type"] == "other":
-                return "Я услышал тебя. Мысль зафиксирована, никаких лишних платежей или заметок создавать не буду! 👍"
+                return "Я услышал тебя. Мысль зафиксирована, никаких лишних изменений в базу вносить не буду! 👍"
 
             elif data["type"] == "reminder":
                 payload = {"chat_id": chat_id, "text": data["description"], "remind_at": data.get("remind_at"), "status": "pending"}
@@ -197,7 +198,7 @@ async def save_data(data: dict, chat_id: int) -> str:
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Робот успешно обновлен до стабильной, зрячей версии!")
+    await message.answer("🚀 Финальная ультимативная версия запущена! Теперь всё полностью автоматизировано.")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
@@ -271,17 +272,38 @@ async def handle_telegram_webhook(request):
 async def handle_keepalive_ping(request):
     return web.Response(text="I am awake!")
 
+# ================= НАДЁЖНЫЙ ВНУТРЕННИЙ ПЛАНОВИК =================
 async def internal_reminder_scheduler():
+    global LAST_EXPENSE_PROMPT_DATE
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    url = f"{SUPABASE_URL}/rest/v1/reminders?status=eq.pending"
+    
     print("🤖 Внутренний планировщик напоминаний успешно запущен!")
     while True:
         try:
+            now = get_now_tashkent()
+            today_str = now.strftime("%Y-%m-%d")
+
+            # --- ФИЧА: ЕЖЕДНЕВНЫЙ АВТО-ОПРОС РАСХОДОВ В 21:00 ПО ТАШКЕНТУ ---
+            if now.hour >= 21 and LAST_EXPENSE_PROMPT_DATE != today_str:
+                try:
+                    res_f = await client.get(f"{SUPABASE_URL}/rest/v1/finance?select=chat_id", headers=headers)
+                    if res_f.status_code == 200:
+                        chat_ids = set(item["chat_id"] for item in res_f.json() if item.get("chat_id"))
+                        for cid in chat_ids:
+                            await bot.send_message(
+                                cid,
+                                "🔔 *Время подвести итоги дня!*\n\nFarxad, привет! Не забудь записать сегодняшние расходы, чтобы аналитика в `/charts` была точной. Просто надиктуй голосом или напиши текстом сюда 👇",
+                                parse_mode="Markdown"
+                            )
+                        LAST_EXPENSE_PROMPT_DATE = today_str
+                except Exception as cron_err:
+                    print(f"Ошибка авто-напоминания расходов: {cron_err}")
+
+            # --- ПРОВЕРКА ПОЛЬЗОВАТЕЛЬСКИХ НАПОМИНАНИЙ ---
             async with httpx.AsyncClient() as client:
-                res = await client.get(url, headers=headers)
+                res = await client.get(f"{SUPABASE_URL}/rest/v1/reminders?status=eq.pending", headers=headers)
                 if res.status_code == 200:
                     reminders = res.json()
-                    now = get_now_tashkent()
                     
                     for r in reminders:
                         if not r.get("remind_at"): continue
