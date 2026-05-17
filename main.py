@@ -6,14 +6,13 @@ import httpx
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.webhook.aiohttp_handler import SimpleRequestHandler, setup_application
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from openai import AsyncOpenAI
 
 # Ключи и доступы
 TELEGRAM_TOKEN = "8820240792:AAFXjs_djEYwPVCwqeOyM7kguSIBV2OdPYw"
 OPENAI_API_KEY = "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"
-SUPABASE_URL = "https://elcmxjlqxlsuzimuvdqe.supabase.co"
+SUPABASE_URL = "https://elcmxjlqhsluzimuvdqe.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsY214amxxaHNsdXppbXV2ZHFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMjMzMzYsImV4cCI6MjA5NDU5OTMzNn0.TJQ1OGX1Wlq_hQC0DN5brBp2BCcB35KNewUy6n75VV0"
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -48,7 +47,6 @@ async def parse_via_ai(text: str) -> dict:
         return {"type": "unknown"}
 
 async def check_missed_tasks(chat_id: int) -> str:
-    """Проверка пропущенных дел при активности пользователя"""
     url = f"{SUPABASE_URL}/rest/v1/tasks?chat_id=eq.{chat_id}&status=eq.Новая"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     alert_text = ""
@@ -61,7 +59,6 @@ async def check_missed_tasks(chat_id: int) -> str:
                     if due_date < datetime.now().date():
                         type_str = "Урок" if item["type"] == "lesson" else "Задача"
                         alert_text += f"\n\n⚠️ *ПРОПУЩЕНО:* {type_str}: {item['description']} (было на {item['due_date']})"
-                        # Помечаем, чтобы не выводить повторно
                         await client.patch(f"{SUPABASE_URL}/rest/v1/tasks?id=eq.{item['id']}", headers={**headers, "Content-Type": "application/json"}, json={"status": "Пропущено"})
     except Exception as e:
         print(f"Ошибка проверки дедлайнов: {e}")
@@ -109,33 +106,9 @@ async def save_data(data: dict, chat_id: int) -> str:
             return f"❌ Ошибка базы: {e}"
     return "🤷‍♂️ Не распознано."
 
-@dp.message(F.text)
-async def handle_text(message: Message):
-    if message.text == "/start":
-        await message.answer("🚀 Бесплатный ИИ-планировщик 24/7 запущен на вебхуках!\nКоманды: `/today`, `/charts`")
-        return
-    await message.answer("🔄 Анализирую...")
-    ai_data = await parse_via_ai(message.text)
-    reply = await save_data(ai_data, message.chat.id)
-    missed_alert = await check_missed_tasks(message.chat.id)
-    await message.answer(reply + missed_alert, parse_mode="Markdown")
-
-@dp.message(F.voice)
-async def handle_voice(message: Message):
-    await message.answer("📥 Скачиваю голос...")
-    file = await bot.get_file(message.voice.file_id)
-    local_file = "voice.ogg"
-    await bot.download_file(file.file_path, local_file)
-    try:
-        with open(local_file, "rb") as f:
-            transcription = await ai_client.audio.transcriptions.create(model="whisper-1", file=f)
-        await message.answer(f"🗣 *Вы сказали:* {transcription.text}", parse_mode="Markdown")
-        ai_data = await parse_via_ai(transcription.text)
-        reply = await save_data(ai_data, message.chat.id)
-        missed_alert = await check_missed_tasks(message.chat.id)
-        await message.answer(reply + missed_alert, parse_mode="Markdown")
-    finally:
-        if os.path.exists(local_file): os.remove(local_file)
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
+    await message.answer("🚀 Бесплатный ИИ-планировщик 24/7 запущен на чистых вебхуках!\nКоманды: `/today`, `/charts`")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
@@ -166,16 +139,52 @@ async def get_charts(message: Message):
             reply += f"🔹 *{cat}*\n`{'🟩'*max(1, round(pct/10))}` {int(pct)}% ({int(amt)} сум)\n\n"
         await message.answer(reply, parse_mode="Markdown")
 
-# Настройка вебхука на сервере Render
-async def on_startup(bot: Bot):
+@dp.message(F.text)
+async def handle_text(message: Message):
+    await message.answer("🔄 Анализирую...")
+    ai_data = await parse_via_ai(message.text)
+    reply = await save_data(ai_data, message.chat.id)
+    missed_alert = await check_missed_tasks(message.chat.id)
+    await message.answer(reply + missed_alert, parse_mode="Markdown")
+
+@dp.message(F.voice)
+async def handle_voice(message: Message):
+    await message.answer("📥 Скачиваю голос...")
+    file = await bot.get_file(message.voice.file_id)
+    local_file = "voice.ogg"
+    await bot.download_file(file.file_path, local_file)
+    try:
+        with open(local_file, "rb") as f:
+            transcription = await ai_client.audio.transcriptions.create(model="whisper-1", file=f)
+        await message.answer(f"🗣 *Вы сказали:* {transcription.text}", parse_mode="Markdown")
+        ai_data = await parse_via_ai(transcription.text)
+        reply = await save_data(ai_data, message.chat.id)
+        missed_alert = await check_missed_tasks(message.chat.id)
+        await message.answer(reply + missed_alert, parse_mode="Markdown")
+    finally:
+        if os.path.exists(local_file): os.remove(local_file)
+
+# ================= КАСТОМНЫЙ ХЕНДЛЕР НА ЧИСТОМ AIOHTTP =================
+async def handle_telegram_webhook(request):
+    """Принимаем обновления напрямую от Telegram без участия модулей aiogram"""
+    try:
+        bot_dict = json.loads(await request.text())
+        update = Update.model_validate(bot_dict, context={"bot": bot})
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        print(f"Ошибка кастомного вебхука: {e}")
+    return web.Response(text="OK")
+
+async def on_startup_service(app):
+    """При старте сервера принудительно связываем бота с Render"""
     webhook_url = f"{os.getenv('RENDER_EXTERNAL_URL')}/webhook"
     await bot.set_webhook(webhook_url)
+    print(f"🚀 Кастомный вебхук успешно привязан к: {webhook_url}")
 
 def main():
-    dp.startup.register(on_startup)
     app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
-    setup_application(app, dp, bot=bot)
+    app.router.add_post('/webhook', handle_telegram_webhook)
+    app.on_startup.append(on_startup_service)
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
 if __name__ == "__main__":
