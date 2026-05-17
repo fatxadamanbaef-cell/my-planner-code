@@ -34,7 +34,7 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# УСИЛЕННЫЙ ПРОМПТ С ЖЁСТКИМ ПРАВИЛОМ ДЛЯ ВОПРОСОВ
+# УЛУЧШЕННЫЙ ПРОМПТ С ЗАЩИТОЙ ОТ ПУТАНИЦЫ ИМЕН
 SYSTEM_PROMPT = """
 Ты — Moneyfi Super Assistant, гибрид быстрого трекера личных финансов и умной CRM для преподавателя.
 Разбери запрос и верни СТРОГИЙ JSON. Никакого лишнего текста вне JSON структуры!
@@ -42,13 +42,17 @@ SYSTEM_PROMPT = """
 Текущая дата: 18 мая 2026 года (Понедельник).
 Текущее время (Ташкент): """ + get_now_tashkent().strftime("%H:%M:%S") + """
 
-КРИТИЧЕСКОЕ ПРАВИЛО: Если пользователь задает ВОПРОС (почему, куда, сколько, где, когда) или рассуждает о данных (например: "почему долг не появился в расходах?") — это СТРОГО тип 'analytics_request'. Типы 'personal_finance' и 'crm_lesson' используются ТОЛЬКО для записи конкретных фактов новых операций!
-
 Варианты message_type:
 1. "personal_finance" — личные расходы или доходы (чистый безнал).
-2. "crm_lesson" — действия с учениками (оплата обучения, статус урока, изменение баланса).
+2. "crm_lesson" — действия с учениками (оплата обучения, статус урока, изменение баланса). Если пользователь говорит, что "оплатили за 12 занятий вперед" или "внесли оплату" — это СТРОГО crm_lesson и action: student_payment, даже если фраза начинается со слова "посчитай"!
 3. "insert_reminder" — пользователь просит НАПОМНИТЬ о чем-то в конкретное время.
-4. "analytics_request" — пользователь хочет посмотреть списки, отчеты, задает вопросы о данных или напоминаниях.
+4. "analytics_request" — пользователь хочет посмотреть списки, отчеты, задает вопросы.
+
+Варианты action для crm_lesson:
+- "student_payment" — факт оплаты пакета уроков (вносит деньги в доходы и пополняет баланс).
+- "lesson_status" — списание проведённого урока.
+- "set_balance" — ручное исправление или установка остатка (например: "у Давида 12 уроков", "Добавь ученика Давида").
+- "set_schedule" — установка постоянного расписания ученика.
 
 СХЕМА ОТВЕТА JSON:
 {
@@ -62,7 +66,7 @@ SYSTEM_PROMPT = """
     "description": string or null
   },
   "crm_data": {
-    "student_name": string or null,
+    "student_name": string or null, // Если имя явно не названо в текущем сообщении, пиши строго null!
     "lesson_state": "conducted" | "rescheduled" | "canceled" | "scheduled" | null,
     "new_datetime": "YYYY-MM-DDTHH:MM" or null,
     "lessons_count": number or null,
@@ -92,14 +96,13 @@ async def generate_smart_reply(user_text: str, db_data: list, context_type: str)
     system_instruction = (
         "Ты — аналитический модуль Moneyfi Super Assistant. Перед тобой сырые данные из базы Supabase. "
         "Сгруппируй информацию ВЕРТИКАЛЬНЫМ СПИСКОМ БЕЗ ТАБЛИЦ (символы '|' и '---' КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ)! "
-        "Используй эмодзи и Markdown. Форматируй строки лаконично, чтобы они идеально читались на узком экране телефона."
+        "Используй эмодзи и Markdown.\n"
+        "КРИТИЧЕСКОЕ ПРАВИЛО: Если пользователь спрашивает про баланс или уроки, но в его текущем вопросе НЕ указано конкретное имя ученика, а в предоставленных данных из базы есть несколько разных студентов (например, Сахиб и Давид), КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО гадать или приписывать цифры первому попавшемуся ученику! В этом случае не выводи отчет, а прямо ответь: 'Уточните, пожалуйста, имя ученика, по которому вы хотите посмотреть остаток уроков?'"
     )
     if context_type == "finance":
-        system_instruction += " Посчитай суммы расходов/доходов, ответь на вопрос пользователя и выведи понятный итог."
+        system_instruction += " Посчитай суммы расходов/доходов."
     elif context_type == "crm":
         system_instruction += " Покажи профили учеников, остатки занятий и их расписание."
-    elif context_type == "reminders":
-        system_instruction += " Покажи список запланированных напоминаний."
 
     try:
         response = await ai_client.chat.completions.create(
@@ -128,9 +131,6 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
             if m_type == "analytics_request":
                 return data.get("chat_reply") or "Запрос обработан."
 
-            # ==========================================
-            # НАПОМИНАНИЯ (ЗАПИСЬ)
-            # ==========================================
             if m_type == "insert_reminder" or action == "reminder":
                 payload = {
                     "chat_id": chat_id, "text": rdata.get("text"),
@@ -139,9 +139,6 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                 await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_reminders", headers=headers, json=payload)
                 return f"🔔 *Напоминание зафиксировано!* \n📅 Время: {payload['remind_at']}\n🎯 Суть: \"{payload['text']}\""
 
-            # ==========================================
-            # ЛИЧНЫЕ ФИНАНСЫ (БЕЗОПАСНЫЙ INT)
-            # ==========================================
             if m_type == "personal_finance":
                 amount_val = fdata.get("amount")
                 payload = {
@@ -150,12 +147,12 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                     "description": fdata.get("description"), "date": fdata.get("date") or get_now_tashkent().strftime("%Y-%m-%d")
                 }
                 await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_finance", headers=headers, json=payload)
-                return f"💰 *{ 'Расход' if action=='expense' else 'Доход' } записан:* {int(amount_val or 0)} {payload['currency']} -> {payload['category']} ({payload['description'] or 'Без описания'})"
+                return f"💰 *{ 'Расход' if action=='expense' else 'Доход' } записан:* {int(amount_val or 0)} {payload['currency']} -> {payload['category']}"
 
-            # ==========================================
-            # CRM СИСТЕМА ДЛЯ УЧЕНИКОВ (БЕЗОПАСНЫЙ INT)
-            # ==========================================
             if m_type == "crm_lesson":
+                if not st_name:
+                    return "❌ Для выполнения операции в CRM необходимо указать имя ученика во фразе."
+
                 if action == "set_schedule":
                     sched_info = cdata.get("schedule_text") or original_text
                     st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{st_name}", headers=headers)
@@ -195,7 +192,7 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                         if st_res.json():
                             new_bal = max(0, st_res.json()[0]["balance_lessons"] - 1)
                             await client.patch(f"{SUPABASE_URL}/rest/v1/moneyfi_students?id=eq.{st_res.json()[0]['id']}", headers=headers, json={"balance_lessons": new_bal})
-                            alert = f"\n⚠️ *Баланс Сахиба на нуле! Нужно обновить оплату.*" if new_bal == 0 else ""
+                            alert = f"\n⚠️ *Баланс {st_name} на нуле! Нужно обновить оплату.*" if new_bal == 0 else ""
                             return f"📉 *CRM:* Урок у *{st_name}* проведён. Списан 1 урок. Остаток: {new_bal} уроков.{alert}"
                         return f"📉 *CRM:* Урок проведён, но баланс студента *{st_name}* не найден."
                     
@@ -203,7 +200,8 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                     return f"📅 *CRM:* Урок студента *{st_name}* переведен в статус: *{states_ru.get(l_payload['lesson_state'], 'Обновлен')}*"
 
                 elif action == "set_balance":
-                    count = cdata.get("lessons_count", 0)
+                    count = cdata.get("lessons_count")
+                    if count is None: count = 0
                     st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{st_name}", headers=headers)
                     if st_res.json():
                         await client.patch(f"{SUPABASE_URL}/rest/v1/moneyfi_students?id=eq.{st_res.json()[0]['id']}", headers=headers, json={"balance_lessons": count})
@@ -218,7 +216,7 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет, Farxad! 🚀 \nЯ — **Moneyfi Super Assistant**.\nВсе личные кошельки и CRM уроков под полным фоновым контролем.",
+        "Привет, Farxad! 🚀 \nЯ — **Moneyfi Super Assistant**.\nВсе личные кошельками и CRM уроков под полным фоновым контролем.",
         reply_markup=get_main_keyboard()
     )
 
@@ -271,14 +269,14 @@ async def btn_report(message: Message):
 async def handle_text(message: Message):
     ai_data = await parse_via_ai(message.text)
     
-    # СМАРТ-ПЕРЕХВАТЧИК: Если ИИ ошибся с типом или это прямой запрос аналитики
-    if ai_data.get("message_type") == "analytics_request" or ai_data.get("finance_data", {}).get("amount") is None:
+    # СМАРТ-ПЕРЕХВАТЧИК ДЛЯ АНАЛИТИКИ И КОРРЕКТНЫХ ВОПРОСОВ БЕЗ ИМЕНИ
+    if ai_data.get("message_type") == "analytics_request" or (ai_data.get("message_type") == "crm_lesson" and ai_data.get("crm_data", {}).get("student_name") is None and ai_data.get("action") != "set_schedule"):
         headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
         async with httpx.AsyncClient() as client:
             res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_finance?chat_id=eq.{message.chat.id}", headers=headers)
             res_stud = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?chat_id=eq.{message.chat.id}", headers=headers)
             combined_data = {"finance": res.json() if res.status_code==200 else [], "students": res_stud.json() if res_stud.status_code==200 else []}
-            reply = await generate_smart_reply(message.text, combined_data, "finance")
+            reply = await generate_smart_reply(message.text, combined_data, "crm")
             return await message.answer(reply, parse_mode="Markdown")
             
     reply = await handle_moneyfi_action(ai_data, message.chat.id, message.text)
@@ -295,12 +293,13 @@ async def handle_voice(message: Message):
         await message.answer(f"🗣 *Вы сказали:* {transcription.text}", parse_mode="Markdown")
         ai_data = await parse_via_ai(transcription.text)
         
-        if ai_data.get("message_type") == "analytics_request" or ai_data.get("finance_data", {}).get("amount") is None:
+        if ai_data.get("message_type") == "analytics_request" or (ai_data.get("message_type") == "crm_lesson" and ai_data.get("crm_data", {}).get("student_name") is None and ai_data.get("action") != "set_schedule"):
             headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
             async with httpx.AsyncClient() as client:
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_finance?chat_id=eq.{message.chat.id}", headers=headers)
-                combined_data = {"finance": res.json() if res.status_code==200 else []}
-                reply = await generate_smart_reply(transcription.text, combined_data, "finance")
+                res_stud = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?chat_id=eq.{message.chat.id}", headers=headers)
+                combined_data = {"finance": res.json() if res.status_code==200 else [], "students": res_stud.json() if res_stud.status_code==200 else []}
+                reply = await generate_smart_reply(transcription.text, combined_data, "crm")
                 return await message.answer(reply, parse_mode="Markdown")
 
         reply = await handle_moneyfi_action(ai_data, message.chat.id, transcription.text)
