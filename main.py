@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, Update
 from openai import AsyncOpenAI
 
-# Ключи Telegram и Supabase
+# Ключи Telegram и Supabase (Оставляем неизменными)
 TELEGRAM_TOKEN = "8820240792:AAFXjs_djEYwPVCwqeOyM7kguSIBV2OdPYw"
 SUPABASE_URL = "https://elcmxjlqhsluzimuvdqe.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsY214amxxaHNsdXppbXV2ZHFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMjMzMzYsImV4cCI6MjA5NDU5OTMzNn0.TJQ1OGX1Wlq_hQC0DN5brBp2BCcB35KNewUy6n75VV0"
@@ -34,18 +34,20 @@ SYSTEM_PROMPT = """
 - 'note' (сохранение новой заметки, мысли или идеи в блокнот)
 - 'reminder' (установка напоминания на конкретное время)
 - 'student_pay' / 'student_lesson' (учёт баланса занятий учеников)
-- 'get_notes' (если пользователь просит ПОКАЗАТЬ, ВЫВЕСТИ, НАЙТИ или ПОСМОТРЕТЬ его сохраненные заметки/мысли)
-- 'get_tasks' (если пользователь просит ПОКАЗАТЬ его планы, актуальные задачи, список дел или расписание)
-- 'other' (простые вежливые фразы, приветствия, "спасибо", "отлично", не содержащие команд на запись или чтение)
+- 'get_notes' (запрос на просмотр сохраненных заметок)
+- 'get_tasks' (запрос на просмотр списка дел, планов или расписания)
+- 'get_balances' (если пользователь хочет УЗНАТЬ БАЛАНС УЧЕНИКОВ, спросить "сколько уроков осталось у Маши" или "покажи балансы")
+- 'complete_task' (если пользователь говорит, что ВЫПОЛНИЛ, СДЕЛАЛ, ЗАВЕРШИЛ или хочет УДАЛИТЬ какую-то задачу/урок из планов)
+- 'other' (вежливость, "спасибо", "привет")
 
 Формат ответа JSON:
 {
   "type": "выбранный_тип",
   "amount": число_или_null,
   "category": "категория_или_null",
-  "description": "суть действия / текст заметки или напоминания",
+  "description": "суть действия / текст заметки или напоминания / ключевые слова задачи для закрытия",
   "date": "ГГГГ-ММ-ДД",
-  "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", // Заполняй строго в этом формате только для типа 'reminder'
+  "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", 
   "student_name": "Имя Ученика или null",
   "count": число_уроков_или_null
 }
@@ -87,8 +89,36 @@ async def save_data(data: dict, chat_id: int) -> str:
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
-            # === НОВАЯ ЛОГИКА: ЧТЕНИЕ ЗАМЕТОК ИЗ БАЗЫ ===
-            if data["type"] == "get_notes":
+            # === ФИЧА 1: ПРОСМОТР БАЛАНСА УЧЕНИКОВ ===
+            if data["type"] == "get_balances":
+                name_query = data.get("student_name")
+                if name_query:
+                    url = f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}&name=ilike.*{name_query}*"
+                else:
+                    url = f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}"
+                
+                res = await client.get(url, headers=headers)
+                if res.status_code == 200 and res.json():
+                    reply = "🎓 *Текущий баланс уроков:* \n\n"
+                    for st in res.json():
+                        reply += f"👤 *{st['name']}:* {st['balance_lessons']} уроков осталось.\n"
+                    return reply
+                return "🎓 Учеников с таким именем или активным балансом не найдено."
+
+            # === ФИЧА 2: ВЫПОЛНЕНИЕ / ЗАКРЫТИЕ ЗАДАЧ ИЗ КАЛЕНДАРЯ ===
+            elif data["type"] == "complete_task":
+                keyword = data.get("description", "")
+                # Находим активную задачу, подходящую под описание
+                res = await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/tasks?chat_id=eq.{chat_id}&status=neq.Выполнено&description=ilike.*{keyword}*",
+                    headers=headers,
+                    json={"status": "Выполнено"}
+                )
+                if res.status_code in [200, 204]:
+                    return f"✅ [Календарь] Задача/урок, содержащая \"{keyword}\", успешно отмечена как *Выполненая*!"
+                return f"❌ Не удалось найти активных задач со словом \"{keyword}\"."
+
+            elif data["type"] == "get_notes":
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/notes?chat_id=eq.{chat_id}", headers=headers)
                 if res.status_code == 200 and res.json():
                     reply = "🧠 *Твой Второй Мозг (Сохраненные заметки):*\n\n"
@@ -97,7 +127,6 @@ async def save_data(data: dict, chat_id: int) -> str:
                     return reply
                 return "🧠 В твоем Втором Мозге пока нет заметок."
 
-            # === НОВАЯ ЛОГИКА: ЧТЕНИЕ ПЛАНОВ И ЗАДАЧ ИЗ БАЗЫ ===
             elif data["type"] == "get_tasks":
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/tasks?chat_id=eq.{chat_id}&status=eq.Новая", headers=headers)
                 if res.status_code == 200 and res.json():
@@ -108,11 +137,9 @@ async def save_data(data: dict, chat_id: int) -> str:
                     return reply
                 return "📌 У тебя нет невыполненных планов и задач!"
 
-            # === НОВАЯ ЛОГИКА: ОВЕТ НА ВЕЖЛИВЫЕ ФРАЗЫ ===
             elif data["type"] == "other":
-                return "Рад помочь! 😊 Если нужно что-то записать, спланировать или напомнить — я на связи."
+                return "Рад помочь! 😊 На связи. Если нужно записать расходы, баланс или планы — просто скажи."
 
-            # === ДАЛЬШЕ СТАНДАРТНАЯ ЗАПИСЬ ДАННЫХ ===
             elif data["type"] == "reminder":
                 payload = {"chat_id": chat_id, "text": data["description"], "remind_at": data.get("remind_at"), "status": "pending"}
                 await client.post(f"{SUPABASE_URL}/rest/v1/reminders", headers=headers, json=payload)
@@ -158,7 +185,7 @@ async def save_data(data: dict, chat_id: int) -> str:
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Ультимативный ИИ-Ассистент обновлен!\n\nТеперь ты можешь не только записывать, но и просить меня выводить информацию обычным языком. \n\nПопробуй написать:\n👉 *«Покажи мои заметки»*\n👉 *«Какие у меня планы?»*", parse_mode="Markdown")
+    await message.answer("🚀 Супер-Ассистент обновлен до максимальной версии! \n\nТеперь доступны все фичи контроля финансов, планов и баланса студентов.")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
@@ -171,22 +198,43 @@ async def get_today(message: Message):
         for t in tasks: reply += f"{'🎓' if t['type']=='lesson' else '📌'} {t['description']}\n"
         await message.answer(reply, parse_mode="Markdown")
 
+# ================= ФИЧА 3: ПОЛНАЯ АНАЛИТИКА ДОХОДОВ И РАСХОДОВ =================
 @dp.message(F.text == "/charts")
 async def get_charts(message: Message):
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     async with httpx.AsyncClient() as client:
-        res = await client.get(f"{SUPABASE_URL}/rest/v1/finance?chat_id=eq.{message.chat.id}&type=eq.expense", headers=headers)
-        expenses = res.json()
-        if not expenses: return await message.answer("📊 Нет расходов.")
-        cat_map, total = {}, 0
-        for e in expenses:
-            cat = e["category"] or "Разное"
-            cat_map[cat] = cat_map.get(cat, 0) + e["amount"]
-            total += e["amount"]
-        reply = f"📊 *АНАЛИТИКА (Всего: {int(total)} сум)*\n\n"
-        for cat, amt in sorted(cat_map.items(), key=lambda x: x[1], reverse=True):
-            pct = (amt / total) * 100
-            reply += f"🔹 *{cat}*\n`{'🟩'*max(1, round(pct/10))}` {int(pct)}% ({int(amt)} сум)\n\n"
+        res = await client.get(f"{SUPABASE_URL}/rest/v1/finance?chat_id=eq.{message.chat.id}", headers=headers)
+        records = res.json()
+        if not records: return await message.answer("📊 Нет финансовых данных для построения аналитики.")
+        
+        total_income = 0
+        total_expense = 0
+        cat_map = {}
+        
+        for r in records:
+            amount = r.get("amount") or 0
+            if r["type"] == "income":
+                total_income += amount
+            elif r["type"] == "expense":
+                total_expense += amount
+                cat = r["category"] or "Разное"
+                cat_map[cat] = cat_map.get(cat, 0) + amount
+                
+        net_profit = total_income - total_expense
+        
+        reply = f"📊 *ПОЛНЫЙ ФИНАНСОВЫЙ ОТЧЕТ*\n\n"
+        reply += f"💰 *Всего доходов:* {int(total_income)} сум\n"
+        reply += f"📉 *Всего расходов:* {int(total_expense)} сум\n"
+        reply += f"🟩 *Чистая прибыль:* {int(net_profit)} сум\n\n"
+        reply += "🍕 *Детализация твоих расходов:*\n"
+        
+        if cat_map:
+            for cat, amt in sorted(cat_map.items(), key=lambda x: x[1], reverse=True):
+                pct = (amt / total_expense) * 100 if total_expense > 0 else 0
+                reply += f"🔹 *{cat}*\n`{'🟩'*max(1, round(pct/10))}` {int(pct)}% ({int(amt)} сум)\n\n"
+        else:
+            reply += "Расходы за этот период отсутствуют."
+            
         await message.answer(reply, parse_mode="Markdown")
 
 @dp.message(F.text)
