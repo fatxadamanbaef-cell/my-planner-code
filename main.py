@@ -34,13 +34,12 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# ИСПРАВЛЕННЫЙ ПРОМПТ: ДОБАВЛЕНО ЧЁТКОЕ РАЗДЕЛЕНИЕ ДЛЯ РАСПИСАНИЯ
 SYSTEM_PROMPT = """
 Ты — Moneyfi Super Assistant, гибрид быстрого трекера личных финансов и умной CRM для преподавателя.
 Разбери запрос и верни СТРОГИЙ JSON. Никакого лишнего текста вне JSON структуры!
 
 Текущая дата: 18 мая 2026 года (Понедельник).
-Текущее время (Ташкент): """ + get_now_tashkent().strftime("%H:%M:%S") + """
+Текущее время (Ташкент): """ + get_now_tashkent().strftime("%Y-%m-%d %H:%M:%S") + """
 
 Варианты message_type:
 1. "personal_finance" — личные расходы или доходы (без привязки к кошелькам, чистый безнал).
@@ -49,10 +48,10 @@ SYSTEM_PROMPT = """
 4. "analytics_request" — пользователь хочет посмотреть списки, отчеты, балансы или напоминания.
 
 Варианты action для crm_lesson:
-- "student_payment" — СТРОГО факт оплаты (купил, оплатил пакет уроков).
-- "lesson_status" — списание проведённого урока (провел занятие, списать урок).
-- "set_balance" — ручное принудительное исправление остатка (осталось всего X уроков, измени баланс на X).
-- "set_schedule" — когда пользователь задаёт, надиктовывает или меняет постоянное РАСПИСАНИЕ ученика (дни недели, время занятия, сколько раз в неделю занимается).
+- "student_payment" — факт оплаты пакета уроков.
+- "lesson_status" — списание проведённого урока.
+- "set_balance" — ручное исправление остатка.
+- "set_schedule" — установка постоянного расписания ученика.
 
 СХЕМА ОТВЕТА JSON:
 {
@@ -66,11 +65,11 @@ SYSTEM_PROMPT = """
     "description": string or null
   },
   "crm_data": {
-    "student_name": string or null, // Всегда с заглавной буквы
+    "student_name": string or null,
     "lesson_state": "conducted" | "rescheduled" | "canceled" | "scheduled" | null,
     "new_datetime": "YYYY-MM-DDTHH:MM" or null,
-    "lessons_count": number or null, // Заполняй ТОЛЬКО для изменения баланса или оплаты. Если речь идет о расписании ("3 раза в неделю"), сюда пиши null!
-    "schedule_text": string or null // Сюда пиши дни и время занятий (например: "Пн, Ср, Пт в 14:30", "3 раза в неделю")
+    "lessons_count": number or null,
+    "schedule_text": string or null
   },
   "reminder_data": {
     "text": string or null,
@@ -101,7 +100,7 @@ async def generate_smart_reply(user_text: str, db_data: list, context_type: str)
     if context_type == "finance":
         system_instruction += " Посчитай суммы расходов/доходов и выведи итог."
     elif context_type == "crm":
-        system_instruction += " Выведи профиль каждого ученика. Напиши его имя, сколько уроков ОСТАЛОСЬ, и обязательно укажи его РАСПИСАНИЕ (из поля schedule), если оно заполнено. Если расписания нет, напиши 'Не задано'."
+        system_instruction += " Выведи профиль каждого ученика. Напиши его имя, сколько уроков ОСТАЛОСЬ, и обязательно укажи его РАСПИСАНИЕ (из поля schedule), если оно заполнено."
     elif context_type == "reminders":
         system_instruction += " Покажи список запланированных будущих напоминаний пользователя."
 
@@ -132,9 +131,6 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
             if m_type == "analytics_request":
                 return data.get("chat_reply") or "Запрос обработан."
 
-            # ==========================================
-            # НАПОМИНАНИЯ (ЗАПИСЬ)
-            # ==========================================
             if m_type == "insert_reminder" or action == "reminder":
                 payload = {
                     "chat_id": chat_id, "text": rdata.get("text"),
@@ -143,9 +139,6 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                 await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_reminders", headers=headers, json=payload)
                 return f"🔔 *Напоминание зафиксировано!* \n📅 Время: {payload['remind_at']}\n🎯 Суть: \"{payload['text']}\""
 
-            # ==========================================
-            # ЛИЧНЫЕ ФИНАНСЫ
-            # ==========================================
             if m_type == "personal_finance":
                 payload = {
                     "chat_id": chat_id, "action": action, "amount": fdata.get("amount"),
@@ -155,11 +148,7 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                 await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_finance", headers=headers, json=payload)
                 return f"💰 *{ 'Расход' if action=='expense' else 'Доход' } записан:* {int(payload['amount'])} {payload['currency']} -> {payload['category']} ({payload['description'] or 'Без описания'})"
 
-            # ==========================================
-            # CRM СИСТЕМА (УЧЕНИКИ)
-            # ==========================================
             if m_type == "crm_lesson":
-                # Установка расписания (НОВАЯ ФИЧА!)
                 if action == "set_schedule":
                     sched_info = cdata.get("schedule_text") or original_text
                     st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{st_name}", headers=headers)
@@ -167,7 +156,7 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                         await client.patch(f"{SUPABASE_URL}/rest/v1/moneyfi_students?id=eq.{st_res.json()[0]['id']}", headers=headers, json={"schedule": sched_info})
                     else:
                         await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_students", headers=headers, json={"chat_id": chat_id, "name": st_name, "balance_lessons": 0, "schedule": sched_info})
-                    return f"📅 *CRM:* Для ученика *{st_name}* успешно установлено расписание: \n➔ `{sched_info}`\n*(Баланс уроков остался без изменений)*"
+                    return f"📅 *CRM:* Для ученика *{st_name}* успешно установлено расписание: \n➔ `{sched_info}`"
 
                 elif action == "student_payment":
                     f_payload = {
@@ -315,6 +304,7 @@ async def handle_telegram_webhook(request):
 async def handle_keepalive_ping(request):
     return web.Response(text="I am awake!")
 
+# ================= ИСПРАВЛЕННЫЙ ФОНОВЫЙ ТАЙМЕР НАПОМИНАНИЙ =================
 async def internal_reminder_scheduler():
     global LAST_EXPENSE_PROMPT_DATE
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -324,6 +314,7 @@ async def internal_reminder_scheduler():
             now = get_now_tashkent()
             today_str = now.strftime("%Y-%m-%d")
 
+            # Вечерний авто-опрос расходов в 21:00
             if now.hour >= 21 and LAST_EXPENSE_PROMPT_DATE != today_str:
                 try:
                     async with httpx.AsyncClient() as client:
@@ -340,14 +331,18 @@ async def internal_reminder_scheduler():
                 except Exception as cron_err:
                     print(f"Ошибка вечернего уведомления: {cron_err}")
 
+            # Проверка точечных напоминаний (С ЖЁСТКИМ СРЕЗОМ ХВОСТА ТАЙМЗОНЫ)
             async with httpx.AsyncClient() as client:
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_reminders?status=eq.pending", headers=headers)
                 if res.status_code == 200:
                     reminders = res.json()
                     for r in reminders:
                         if not r.get("remind_at"): continue
-                        remind_str = r["remind_at"].replace("T", " ").split(".")[0]
+                        
+                        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: берём строго первые 19 символов (ГГГГ-ММ-ДД ВВ:ММ:СС)
+                        remind_str = r["remind_at"].replace("T", " ")[:19]
                         remind_time = datetime.strptime(remind_str, "%Y-%m-%d %H:%M:%S")
+                        
                         if remind_time <= now:
                             try:
                                 await bot.send_message(r["chat_id"], f"⏰ *НАПОМИНАНИЕ:* \n\n{r['text']}", parse_mode="Markdown")
