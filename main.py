@@ -14,7 +14,7 @@ TELEGRAM_TOKEN = "8820240792:AAFXjs_djEYwPVCwqeOyM7kguSIBV2OdPYw"
 SUPABASE_URL = "https://elcmxjlqhsluzimuvdqe.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsY214amxxaHNsdXppbXV2ZHFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMjMzMzYsImV4cCI6MjA5NDU5OTMzNn0.TJQ1OGX1Wlq_hQC0DN5brBp2BCcB35KNewUy6n75VV0"
 
-# Ключ OpenAI безопасно берется из настроек Render
+# Ключь OpenAI безопасно берется из настроек Render
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -22,7 +22,7 @@ dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 def get_now_tashkent():
-    """Внутренний помощник: всегда возвращает точное время в Ташкенте (UTC+5)"""
+    """Всегда возвращает точное время в Ташкенте (UTC+5)"""
     return datetime.utcnow() + timedelta(hours=5)
 
 SYSTEM_PROMPT = """
@@ -38,7 +38,7 @@ SYSTEM_PROMPT = """
   "category": "категория_или_null",
   "description": "суть действия или текст напоминания",
   "date": "ГГГГ-ММ-ДД",
-  "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", // Заполни строго в формате ГГГГ-ММ-ДД ВВ:ММ:СС только для типа 'reminder'
+  "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", // Формат строго ГГГГ-ММ-ДД ВВ:ММ:СС только для типа 'reminder'
   "student_name": "Имя Ученика или null",
   "count": число_уроков_или_null
 }
@@ -47,7 +47,6 @@ SYSTEM_PROMPT = """
 
 async def parse_via_ai(text: str) -> dict:
     try:
-        # Обновляем системный промпт со свежим временем при каждом запросе
         current_prompt = SYSTEM_PROMPT.split("Текущие дата")[0] + f"Текущие дата и время для расчета (Ташкент): {get_now_tashkent().strftime('%Y-%m-%d %H:%M:%S')}\n"
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -84,7 +83,6 @@ async def save_data(data: dict, chat_id: int) -> str:
             if data["type"] == "reminder":
                 payload = {"chat_id": chat_id, "text": data["description"], "remind_at": data.get("remind_at"), "status": "pending"}
                 await client.post(f"{SUPABASE_URL}/rest/v1/reminders", headers=headers, json=payload)
-                # Красиво форматируем для ответа пользователю
                 return f"🔔 *Напоминание зафиксировано!* \n📅 Время: {data.get('remind_at')}\n🎯 Суть: \"{data['description']}\""
 
             elif data["type"] in ["expense", "income"]:
@@ -194,52 +192,55 @@ async def handle_telegram_webhook(request):
         print(f"Ошибка вебхука: {e}")
     return web.Response(text="OK")
 
-# ================= МИНУТНЫЙ ПРОВЕРЩИК НАПОМИНАНИЙ (CRON) =================
-async def handle_cron(request):
-    """Этот метод вызывается каждую минуту внешним будильником"""
+async def handle_keepalive_ping(request):
+    """Сюда будут стучать Google Таблицы раз в 10 минут, просто чтобы бот не спал"""
+    return web.Response(text="I am awake!")
+
+# ================= ВНУТРЕННИЙ РОБОТ НАПОМИНАНИЙ (БЕЗ ВНЕШНЕГО КРОНА) =================
+async def internal_reminder_scheduler():
+    """Бесконечный цикл внутри Python, который сам проверяет базу каждые 60 секунд"""
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     url = f"{SUPABASE_URL}/rest/v1/reminders?status=eq.pending"
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.get(url, headers=headers)
-            if res.status_code == 200:
-                reminders = res.json()
-                now = get_now_tashkent()
-                
-                for r in reminders:
-                    # Убираем возможную букву T из таймстампа Supabase
-                    remind_str = r["remind_at"].replace("T", " ").split(".")[0]
-                    remind_time = datetime.strptime(remind_str, "%Y-%m-%d %H:%M:%S")
+    
+    print("🤖 Внутренний планировщик напоминаний успешно запущен!")
+    
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(url, headers=headers)
+                if res.status_code == 200:
+                    reminders = res.json()
+                    now = get_now_tashkent()
                     
-                    # Если время напоминания пришло или уже слегка прошло
-                    if remind_time <= now:
-                        try:
-                            # Бот сам пишет тебе в чат!
-                            await bot.send_message(
-                                r["chat_id"], 
-                                f"⏰ *НАПОМИНАНИЕ:* \n\n{r['text']}", 
-                                parse_mode="Markdown"
-                            )
-                            # Помечаем напоминание как отправленное
-                            await client.patch(
-                                f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{r['id']}", 
-                                headers={**headers, "Content-Type": "application/json"}, 
-                                json={"status": "sent"}
-                            )
-                        except Exception as msg_err:
-                            print(f"Не удалось отправить напоминание: {msg_err}")
-    except Exception as e:
-        print(f"Ошибка в минутном кроне: {e}")
-    return web.Response(text="OK")
+                    for r in reminders:
+                        remind_str = r["remind_at"].replace("T", " ").split(".")[0]
+                        remind_time = datetime.strptime(remind_str, "%Y-%m-%d %H:%M:%S")
+                        
+                        if remind_time <= now:
+                            try:
+                                await bot.send_message(r["chat_id"], f"⏰ *НАПОМИНАНИЕ:* \n\n{r['text']}", parse_mode="Markdown")
+                                await client.patch(
+                                    f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{r['id']}", 
+                                    headers={**headers, "Content-Type": "application/json"}, 
+                                    json={"status": "sent"}
+                                )
+                            except Exception as msg_err:
+                                print(f"Ошибка отправки сообщения: {msg_err}")
+        except Exception as e:
+            print(f"Ошибка проверки во внутреннем цикле: {e}")
+            
+        await asyncio.sleep(60) # Спокойно спим ровно 1 минуту внутри Python
 
 async def on_startup_service(app):
     webhook_url = f"{os.getenv('RENDER_EXTERNAL_URL')}/webhook"
     await bot.set_webhook(webhook_url)
+    # Запускаем внутренний таймер прямо на старте сервера!
+    asyncio.create_task(internal_reminder_scheduler())
 
 def main():
     app = web.Application()
     app.router.add_post('/webhook', handle_telegram_webhook)
-    app.router.add_get('/cron', handle_cron)
+    app.router.add_get('/cron', handle_keepalive_ping) # Старый адрес теперь работает как пинг-ответчик
     app.on_startup.append(on_startup_service)
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
