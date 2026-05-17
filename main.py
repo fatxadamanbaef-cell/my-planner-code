@@ -21,7 +21,6 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Переменная для отслеживания ежедневного напоминания о расходах
 LAST_EXPENSE_PROMPT_DATE = ""
 
 def get_now_tashkent():
@@ -32,26 +31,22 @@ SYSTEM_PROMPT = """
 Ты — ультимативный ИИ-ассистент. Разбери запрос пользователя и верни ТОЛЬКО чистый JSON.
 
 Типы (type):
-- 'expense' / 'income' (расходы / доходы)
-- 'task' / 'lesson' (добавление новой задачи или нового урока в календарь)
-- 'note' (сохранение новой заметки, мысли или идеи в блокнот)
-- 'reminder' (установка напоминания на конкретное время)
-- 'student_pay' (СТРОГО факт совершившейся оплаты! Когда ученик КУПИЛ, ОПЛАТИЛ занятия.)
-- 'student_lesson' (списание проведенных уроков)
-- 'student_set_balance' (ручное изменение/исправление баланса ученика)
-- 'get_notes' (запрос на просмотр сохраненных заметок/мыслей)
-- 'get_tasks' (запрос на просмотр списка дел, планов или расписания)
-- 'get_reminders' (запрос списка активных напоминалок)
-- 'get_balances' (запрос баланса уроков студентов)
+- 'expense' / 'income' (СТРОГО добавление НОВОГО расхода или дохода. Например: "купил кофе", "заработал 50000")
+- 'task' / 'lesson' (добавление новой задачи или урока в календарь)
+- 'note' (сохранение новой заметки/мысли в блокнот)
+- 'reminder' (установка напоминания)
+- 'student_pay' / 'student_lesson' / 'student_set_balance' (учет баланса студентов)
+- 'get_notes' / 'get_tasks' / 'get_reminders' / 'get_balances' (просмотр списков данных)
+- 'get_finance' (если пользователь хочет ПОСМОТРЕТЬ ИСТОРИЮ своих денег, пишет "покажи расходы", "куда потратил деньги из Еда", "покажи доходы". Если в запросе звучит конкретная категория, запиши её название в поле 'category'. Если спрашивает строго про расходы, запиши 'expense' в поле 'description', если про доходы — 'income' в поле 'description')
 - 'complete_task' (завершение задачи из календаря)
-- 'other' (вежливость, вопросы, рассуждения, не требующие записи в базу)
+- 'other' (вежливость, простые фразы)
 
 Формат ответа JSON:
 {
   "type": "выбранный_тип",
   "amount": число_или_null,
   "category": "категория_или_null",
-  "description": "суть действия / текст напоминания",
+  "description": "суть действия / тип фильтра для финансов",
   "date": "ГГГГ-ММ-ДД",
   "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", 
   "student_name": "Имя Ученика или null",
@@ -98,7 +93,28 @@ async def save_data(data: dict, chat_id: int) -> str:
             raw_name = data.get("student_name")
             student_name = raw_name.strip().lower().capitalize() if raw_name else None
 
-            if data["type"] == "get_balances":
+            # === НОВАЯ ЛОГИКА: ПОИСК И ДЕТАЛИЗАЦИЯ РАСХОДОВ/ДОХОДОВ ===
+            if data["type"] == "get_finance":
+                res = await client.get(f"{SUPABASE_URL}/rest/v1/finance?chat_id=eq.{chat_id}", headers=headers)
+                if res.status_code == 200 and res.json():
+                    records = res.json()
+                    filter_cat = data.get("category")
+                    filter_type = data.get("description") # 'expense' или 'income'
+                    
+                    reply = "💰 *История твоих финансовых записей:*\n\n"
+                    found = False
+                    for r in sorted(records, key=lambda x: x.get('date', ''), reverse=True):
+                        if filter_cat and filter_cat.lower() not in (r.get("category") or "").lower(): continue
+                        if filter_type and r.get("type") != filter_type: continue
+                        
+                        found = True
+                        icon = "📉 Расход:" if r["type"] == "expense" else "🪙 Доход:"
+                        reply += f"{icon} *{int(r['amount'])} сум* — {r['description']} [Категория: {r['category']}] ({r.get('date', '---')})\n"
+                    
+                    return reply if found else "🔍 Записей по твоему финансовому запросу не найдено."
+                return "💰 У тебя пока нет сохраненных финансовых записей."
+
+            elif data["type"] == "get_balances":
                 url = f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}&name=ilike.*{student_name}*" if student_name else f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}"
                 res = await client.get(url, headers=headers)
                 if res.status_code == 200 and res.json():
@@ -126,7 +142,7 @@ async def save_data(data: dict, chat_id: int) -> str:
                     await client.patch(f"{SUPABASE_URL}/rest/v1/students?id=eq.{students[0]['id']}", headers=headers, json={"balance_lessons": lessons_count})
                 else:
                     await client.post(f"{SUPABASE_URL}/rest/v1/students", headers=headers, json={"chat_id": chat_id, "name": student_name, "balance_lessons": lessons_count})
-                return f"🔧 [Ученики] Баланс пользователя *{student_name}* успешно изменен/установлен на *{lessons_count}* уроков."
+                return f"🔧 [Ученики] Баланс пользователя *{student_name}* успешно изменен на *{lessons_count}* уроков."
 
             elif data["type"] == "student_pay":
                 lessons_count = data.get("count", 1) or 1
@@ -171,7 +187,7 @@ async def save_data(data: dict, chat_id: int) -> str:
                 return "📌 Нет активных задач!"
 
             elif data["type"] == "other":
-                return "Я услышал тебя. Мысль зафиксирована, никаких лишних изменений в базу вносить не буду! 👍"
+                return "Я услышал тебя. Мысль зафиксирована, никаких лишних записей в базу делать не буду! 👍"
 
             elif data["type"] == "reminder":
                 payload = {"chat_id": chat_id, "text": data["description"], "remind_at": data.get("remind_at"), "status": "pending"}
@@ -198,7 +214,7 @@ async def save_data(data: dict, chat_id: int) -> str:
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Финальная ультимативная версия запущена! Теперь всё полностью автоматизировано.")
+    await message.answer("🚀 Система полностью обновлена! Теперь ИИ идеально различает запись финансов и поиск по ним.")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
@@ -272,44 +288,39 @@ async def handle_telegram_webhook(request):
 async def handle_keepalive_ping(request):
     return web.Response(text="I am awake!")
 
-# ================= НАДЁЖНЫЙ ВНУТРЕННИЙ ПЛАНОВИК =================
 async def internal_reminder_scheduler():
     global LAST_EXPENSE_PROMPT_DATE
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    
     print("🤖 Внутренний планировщик напоминаний успешно запущен!")
     while True:
         try:
             now = get_now_tashkent()
             today_str = now.strftime("%Y-%m-%d")
 
-            # --- ФИЧА: ЕЖЕДНЕВНЫЙ АВТО-ОПРОС РАСХОДОВ В 21:00 ПО ТАШКЕНТУ ---
             if now.hour >= 21 and LAST_EXPENSE_PROMPT_DATE != today_str:
                 try:
-                    res_f = await client.get(f"{SUPABASE_URL}/rest/v1/finance?select=chat_id", headers=headers)
-                    if res_f.status_code == 200:
-                        chat_ids = set(item["chat_id"] for item in res_f.json() if item.get("chat_id"))
-                        for cid in chat_ids:
-                            await bot.send_message(
-                                cid,
-                                "🔔 *Время подвести итоги дня!*\n\nFarxad, привет! Не забудь записать сегодняшние расходы, чтобы аналитика в `/charts` была точной. Просто надиктуй голосом или напиши текстом сюда 👇",
-                                parse_mode="Markdown"
-                            )
-                        LAST_EXPENSE_PROMPT_DATE = today_str
+                    async with httpx.AsyncClient() as client:
+                        res_f = await client.get(f"{SUPABASE_URL}/rest/v1/finance?select=chat_id", headers=headers)
+                        if res_f.status_code == 200:
+                            chat_ids = set(item["chat_id"] for item in res_f.json() if item.get("chat_id"))
+                            for cid in chat_ids:
+                                await bot.send_message(
+                                    cid,
+                                    "🔔 *Время подвести итоги дня!*\n\nFarxad, привет! Не забудь записать сегодняшние расходы, чтобы аналитика в `/charts` была точной. Просто надиктуй голосом или напиши текстом сюда 👇",
+                                    parse_mode="Markdown"
+                                )
+                            LAST_EXPENSE_PROMPT_DATE = today_str
                 except Exception as cron_err:
                     print(f"Ошибка авто-напоминания расходов: {cron_err}")
 
-            # --- ПРОВЕРКА ПОЛЬЗОВАТЕЛЬСКИХ НАПОМИНАНИЙ ---
             async with httpx.AsyncClient() as client:
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/reminders?status=eq.pending", headers=headers)
                 if res.status_code == 200:
                     reminders = res.json()
-                    
                     for r in reminders:
                         if not r.get("remind_at"): continue
                         remind_str = r["remind_at"].replace("T", " ").split(".")[0]
                         remind_time = datetime.strptime(remind_str, "%Y-%m-%d %H:%M:%S")
-                        
                         if remind_time <= now:
                             try:
                                 await bot.send_message(r["chat_id"], f"⏰ *НАПОМИНАНИЕ:* \n\n{r['text']}", parse_mode="Markdown")
