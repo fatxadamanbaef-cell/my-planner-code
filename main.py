@@ -22,7 +22,7 @@ dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 def get_now_tashkent():
-    """Возвращает точное время в Ташкенте (UTC+5) без использования устаревших методов"""
+    """Возвращает точное время в Ташкенте (UTC+5)"""
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=5)
 
 SYSTEM_PROMPT = """
@@ -33,25 +33,26 @@ SYSTEM_PROMPT = """
 - 'task' / 'lesson' (добавление новой задачи или нового урока в календарь)
 - 'note' (сохранение новой заметки, мысли или идеи в блокнот)
 - 'reminder' (установка напоминания на конкретное время)
-- 'student_pay' (когда ученик ЗАПЛАТИЛ, КУПИЛ пакет уроков или внес предоплату)
-- 'student_lesson' (когда преподаватель ПРОВЕЛ урок или уроки у студента и их нужно СПИСАТЬ)
-- 'student_set_balance' (когда нужно ИСПРАВИТЬ баланс, УСТАНОВИТЬ жесткое значение, или когда пользователь говорит "осталось всего X уроков", "убери, у него X уроков")
-- 'get_notes' (запрос на просмотр сохраненных заметок)
+- 'student_pay' (СТРОГО факт совершившейся оплаты! Когда ученик КУПИЛ, ОПЛАТИЛ занятия. Если фраза в будущем времени "должен оплатить" или вопрос "что там с оплатой" — это НЕ этот тип!)
+- 'student_lesson' (списание проведенных уроков)
+- 'student_set_balance' (ручное изменение/исправление баланса ученика)
+- 'get_notes' (запрос на просмотр сохраненных заметок/мыслей)
 - 'get_tasks' (запрос на просмотр списка дел, планов или расписания)
+- 'get_reminders' (если пользователь просит ПОКАЗАТЬ НАПОМИНАНИЯ, вывести список напоминалок)
 - 'get_balances' (запрос баланса уроков студентов)
 - 'complete_task' (завершение задачи из календаря)
-- 'other' (вежливость, простые фразы)
+- 'other' (вежливость, вопросы, рассуждения, не требующие записи в базу)
 
 Формат ответа JSON:
 {
   "type": "выбранный_тип",
   "amount": число_или_null,
   "category": "категория_или_null",
-  "description": "суть действия",
+  "description": "суть действия / текст напоминания",
   "date": "ГГГГ-ММ-ДД",
   "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", 
   "student_name": "Имя Ученика или null",
-  "count": число_уроков_или_null // Сюда пиши количество уроков (сколько куплено, сколько проведено или сколько должно остаться)
+  "count": число_уроков_или_null
 }
 Текущие дата и время для расчета (Ташкент): """ + get_now_tashkent().strftime("%Y-%m-%d %H:%M:%S") + """
 """
@@ -91,48 +92,61 @@ async def save_data(data: dict, chat_id: int) -> str:
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
+            # Нормализация имени студента (ЗАЩИТА от дублей: "САХИБ" -> "Сахиб")
+            raw_name = data.get("student_name")
+            student_name = raw_name.strip().lower().capitalize() if raw_name else None
+
             if data["type"] == "get_balances":
-                name_query = data.get("student_name")
-                url = f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}&name=ilike.*{name_query}*" if name_query else f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}"
+                url = f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}&name=ilike.*{student_name}*" if student_name else f"{SUPABASE_URL}/rest/v1/students?chat_id=eq.{chat_id}"
                 res = await client.get(url, headers=headers)
                 if res.status_code == 200 and res.json():
                     reply = "🎓 *Текущий баланс уроков:* \n\n"
-                    for st in res.json():
-                        reply += f"👤 *{st['name']}:* {st['balance_lessons']} уроков осталось.\n"
+                    for st in res.json(): reply += f"👤 *{st['name']}:* {st['balance_lessons']} уроков осталось.\n"
                     return reply
                 return "🎓 Учеников с активным балансом не найдено."
 
-            # === ИСПРАВЛЕНИЕ / ЖЕСТКАЯ УСТАНОВКА БАЛАНСА ===
+            # === НОВАЯ ЛОГИКА: ВЫВОД НАПОМИНАНИЙ ===
+            elif data["type"] == "get_reminders":
+                res = await client.get(f"{SUPABASE_URL}/rest/v1/reminders?chat_id=eq.{chat_id}&status=eq.pending", headers=headers)
+                if res.status_code == 200 and res.json():
+                    reply = "🔔 *Твои активные напоминания:*\n\n"
+                    for r in res.json():
+                        if r.get("remind_at"):
+                            t_str = r["remind_at"].replace("T", " ").split(".")[0]
+                            reply += f"🔹 [{t_str}] {r['text']}\n"
+                    return reply
+                return "🔔 У тебя нет активных напоминаний."
+
             elif data["type"] == "student_set_balance":
                 lessons_count = data.get("count", 0)
-                st_res = await client.get(f"{SUPABASE_URL}/rest/v1/students?name=eq.{data['student_name']}", headers=headers)
+                st_res = await client.get(f"{SUPABASE_URL}/rest/v1/students?name=eq.{student_name}", headers=headers)
                 students = st_res.json()
                 if students:
                     await client.patch(f"{SUPABASE_URL}/rest/v1/students?id=eq.{students[0]['id']}", headers=headers, json={"balance_lessons": lessons_count})
                 else:
-                    await client.post(f"{SUPABASE_URL}/rest/v1/students", headers=headers, json={"chat_id": chat_id, "name": data["student_name"], "balance_lessons": lessons_count})
-                return f"🔧 [Ученики] Баланс пользователя *{data['student_name']}* успешно изменен/установлен на *{lessons_count}* уроков."
+                    await client.post(f"{SUPABASE_URL}/rest/v1/students", headers=headers, json={"chat_id": chat_id, "name": student_name, "balance_lessons": lessons_count})
+                return f"🔧 [Ученики] Баланс пользователя *{student_name}* успешно изменен/установлен на *{lessons_count}* уроков."
 
             elif data["type"] == "student_pay":
-                st_res = await client.get(f"{SUPABASE_URL}/rest/v1/students?name=eq.{data['student_name']}", headers=headers)
+                lessons_count = data.get("count", 1) or 1
+                st_res = await client.get(f"{SUPABASE_URL}/rest/v1/students?name=eq.{student_name}", headers=headers)
                 students = st_res.json()
-                lessons_count = data.get("count", 1)
                 if students:
                     new_bal = students[0]["balance_lessons"] + lessons_count
                     await client.patch(f"{SUPABASE_URL}/rest/v1/students?id=eq.{students[0]['id']}", headers=headers, json={"balance_lessons": new_bal})
                 else:
-                    await client.post(f"{SUPABASE_URL}/rest/v1/students", headers=headers, json={"chat_id": chat_id, "name": data["student_name"], "balance_lessons": lessons_count})
-                return f"🎓 [Ученики] Добавлено +{lessons_count} уроков для {data['student_name']}."
+                    await client.post(f"{SUPABASE_URL}/rest/v1/students", headers=headers, json={"chat_id": chat_id, "name": student_name, "balance_lessons": lessons_count})
+                return f"🎓 [Ученики] Добавлено +{lessons_count} уроков для {student_name}."
 
             elif data["type"] == "student_lesson":
-                st_res = await client.get(f"{SUPABASE_URL}/rest/v1/students?name=eq.{data['student_name']}", headers=headers)
+                st_res = await client.get(f"{SUPABASE_URL}/rest/v1/students?name=eq.{student_name}", headers=headers)
                 students = st_res.json()
-                lessons_count = data.get("count", 1) # Теперь берем реальное число проведенных уроков из ИИ
+                lessons_count = data.get("count", 1) or 1
                 if students:
                     new_bal = max(0, students[0]["balance_lessons"] - lessons_count)
                     await client.patch(f"{SUPABASE_URL}/rest/v1/students?id=eq.{students[0]['id']}", headers=headers, json={"balance_lessons": new_bal})
-                    return f"📉 [Ученики] Списано {lessons_count} урок(ов) у {data['student_name']}. Остаток: {new_bal} уроков."
-                return f"❌ Ученик {data['student_name']} не найден."
+                    return f"📉 [Ученики] Списано {lessons_count} урок(ов) у {student_name}. Остаток: {new_bal} уроков."
+                return f"❌ Ученик {student_name} не найден."
 
             elif data["type"] == "complete_task":
                 keyword = data.get("description", "")
@@ -156,7 +170,7 @@ async def save_data(data: dict, chat_id: int) -> str:
                 return "📌 Нет активных задач!"
 
             elif data["type"] == "other":
-                return "Рад помочь! 😊 Спрашивай баланс учеников, вноси расходы или планы."
+                return "Я услышал тебя. Мысль зафиксирована, никаких лишних платежей или заметок создавать не буду! 👍"
 
             elif data["type"] == "reminder":
                 payload = {"chat_id": chat_id, "text": data["description"], "remind_at": data.get("remind_at"), "status": "pending"}
@@ -183,7 +197,7 @@ async def save_data(data: dict, chat_id: int) -> str:
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Система обновлена до финальной стабильной версии! Ошибки устранены, добавлен точный учет и ручная коррекция баланса учеников.")
+    await message.answer("🚀 Робот успешно обновлен до стабильной, зрячей версии!")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
@@ -196,7 +210,6 @@ async def get_today(message: Message):
         for t in tasks: reply += f"{'🎓' if t['type']=='lesson' else '📌'} {t['description']}\n"
         await message.answer(reply, parse_mode="Markdown")
 
-@dp.message(F.charts == "/charts")
 @dp.message(F.text == "/charts")
 async def get_charts(message: Message):
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -258,7 +271,6 @@ async def handle_telegram_webhook(request):
 async def handle_keepalive_ping(request):
     return web.Response(text="I am awake!")
 
-# ================= БЕЗОПАСНЫЙ ВНУТРЕННИЙ РОБОТ НАПОМИНАНИЙ =================
 async def internal_reminder_scheduler():
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     url = f"{SUPABASE_URL}/rest/v1/reminders?status=eq.pending"
@@ -272,21 +284,14 @@ async def internal_reminder_scheduler():
                     now = get_now_tashkent()
                     
                     for r in reminders:
-                        # ЗАЩИТА: Если запись сломана или пустая, просто идем дальше
-                        if not r.get("remind_at"):
-                            continue
-                            
+                        if not r.get("remind_at"): continue
                         remind_str = r["remind_at"].replace("T", " ").split(".")[0]
                         remind_time = datetime.strptime(remind_str, "%Y-%m-%d %H:%M:%S")
                         
                         if remind_time <= now:
                             try:
                                 await bot.send_message(r["chat_id"], f"⏰ *НАПОМИНАНИЕ:* \n\n{r['text']}", parse_mode="Markdown")
-                                await client.patch(
-                                    f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{r['id']}", 
-                                    headers={**headers, "Content-Type": "application/json"}, 
-                                    json={"status": "sent"}
-                                )
+                                await client.patch(f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{r['id']}", headers={**headers, "Content-Type": "application/json"}, json={"status": "sent"})
                             except Exception as msg_err:
                                 print(f"Ошибка отправки сообщения: {msg_err}")
         except Exception as e:
