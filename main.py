@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import httpx
 from aiohttp import web
 
@@ -9,39 +9,49 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from openai import AsyncOpenAI
 
-# Ключи Telegram и Supabase остаются тут (их GitHub не блокирует)
+# Ключи Telegram и Supabase
 TELEGRAM_TOKEN = "8820240792:AAFXjs_djEYwPVCwqeOyM7kguSIBV2OdPYw"
 SUPABASE_URL = "https://elcmxjlqhsluzimuvdqe.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsY214amxxaHNsdXppbXV2ZHFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMjMzMzYsImV4cCI6MjA5NDU5OTMzNn0.TJQ1OGX1Wlq_hQC0DN5brBp2BCcB35KNewUy6n75VV0"
 
-# Ключ OpenAI теперь будет браться из безопасных настроек Render
+# Ключ OpenAI безопасно берется из настроек Render
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+def get_now_tashkent():
+    """Внутренний помощник: всегда возвращает точное время в Ташкенте (UTC+5)"""
+    return datetime.utcnow() + timedelta(hours=5)
+
 SYSTEM_PROMPT = """
 Ты — ультимативный ИИ-ассистент. Разбери запрос пользователя и верни ТОЛЬКО чистый JSON.
-Типы (type): 'expense', 'income', 'task', 'lesson', 'note', 'student_pay', 'student_lesson'.
+Типы (type): 'expense', 'income', 'task', 'lesson', 'note', 'student_pay', 'student_lesson', 'reminder'.
+
+ВАЖНО: Если пользователь просит О ЧЕМ-ТО НАПОМНИТЬ в конкретное время или день (например: "напомни в 14:30...", "напомни завтра утром..."), ставь type = 'reminder'.
+
 Формат ответа JSON:
 {
-  "type": "expense/income/task/lesson/note/student_pay/student_lesson",
+  "type": "expense/income/task/lesson/note/student_pay/student_lesson/reminder",
   "amount": число_или_null,
   "category": "категория_или_null",
-  "description": "суть действия",
+  "description": "суть действия или текст напоминания",
   "date": "ГГГГ-ММ-ДД",
+  "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", // Заполни строго в формате ГГГГ-ММ-ДД ВВ:ММ:СС только для типа 'reminder'
   "student_name": "Имя Ученика или null",
   "count": число_уроков_или_null
 }
-Текущая дата: """ + datetime.now().strftime("%Y-%m-%d") + """
+Текущие дата и время для расчета (Ташкент): """ + get_now_tashkent().strftime("%Y-%m-%d %H:%M:%S") + """
 """
 
 async def parse_via_ai(text: str) -> dict:
     try:
+        # Обновляем системный промпт со свежим временем при каждом запросе
+        current_prompt = SYSTEM_PROMPT.split("Текущие дата")[0] + f"Текущие дата и время для расчета (Ташкент): {get_now_tashkent().strftime('%Y-%m-%d %H:%M:%S')}\n"
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}],
+            messages=[{"role": "system", "content": current_prompt}, {"role": "user", "content": text}],
             response_format={"type": "json_object"}
         )
         return json.loads(response.choices[0].message.content)
@@ -59,7 +69,7 @@ async def check_missed_tasks(chat_id: int) -> str:
             if res.status_code == 200:
                 for item in res.json():
                     due_date = datetime.strptime(item["due_date"], "%Y-%m-%d").date()
-                    if due_date < datetime.now().date():
+                    if due_date < get_now_tashkent().date():
                         type_str = "Урок" if item["type"] == "lesson" else "Задача"
                         alert_text += f"\n\n⚠️ *ПРОПУЩЕНО:* {type_str}: {item['description']} (было на {item['due_date']})"
                         await client.patch(f"{SUPABASE_URL}/rest/v1/tasks?id=eq.{item['id']}", headers={**headers, "Content-Type": "application/json"}, json={"status": "Пропущено"})
@@ -71,7 +81,13 @@ async def save_data(data: dict, chat_id: int) -> str:
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
-            if data["type"] in ["expense", "income"]:
+            if data["type"] == "reminder":
+                payload = {"chat_id": chat_id, "text": data["description"], "remind_at": data.get("remind_at"), "status": "pending"}
+                await client.post(f"{SUPABASE_URL}/rest/v1/reminders", headers=headers, json=payload)
+                # Красиво форматируем для ответа пользователю
+                return f"🔔 *Напоминание зафиксировано!* \n📅 Время: {data.get('remind_at')}\n🎯 Суть: \"{data['description']}\""
+
+            elif data["type"] in ["expense", "income"]:
                 payload = {"chat_id": chat_id, "type": data["type"], "amount": data["amount"], "category": data.get("category", "Разное"), "description": data["description"], "date": data.get("date")}
                 await client.post(f"{SUPABASE_URL}/rest/v1/finance", headers=headers, json=payload)
                 return f"💰 [Облако] {'Расход' if data['type']=='expense' else 'Доход'} сохранен: {data['amount']} сум ({data['description']})"
@@ -111,13 +127,13 @@ async def save_data(data: dict, chat_id: int) -> str:
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Бесплатный ИИ-планировщик 24/7 запущен!\nКоманды: `/today`, `/charts`")
+    await message.answer("🚀 Ультимативный ИИ-Ассистент запущен 24/7 в облаке!\n\nПросто пиши расходы, заметки или говори: *«Напомни мне в 14:30 сделать тесты»* — я сам напишу тебе в нужное время!", parse_mode="Markdown")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     async with httpx.AsyncClient() as client:
-        res = await client.get(f"{SUPABASE_URL}/rest/v1/tasks?chat_id=eq.{message.chat.id}&due_date=eq.{datetime.now().strftime('%Y-%m-%d')}", headers=headers)
+        res = await client.get(f"{SUPABASE_URL}/rest/v1/tasks?chat_id=eq.{message.chat.id}&due_date=eq.{get_now_tashkent().strftime('%Y-%m-%d')}", headers=headers)
         tasks = res.json()
         if not tasks: return await message.answer("☕️ На сегодня задач нет.")
         reply = "📅 *Расписание на сегодня:*\n\n"
@@ -144,7 +160,7 @@ async def get_charts(message: Message):
 
 @dp.message(F.text)
 async def handle_text(message: Message):
-    await message.answer("🔄 Анализирую текст...")
+    await message.answer("🔄 Анализирую...")
     ai_data = await parse_via_ai(message.text)
     reply = await save_data(ai_data, message.chat.id)
     missed_alert = await check_missed_tasks(message.chat.id)
@@ -165,7 +181,7 @@ async def handle_voice(message: Message):
         missed_alert = await check_missed_tasks(message.chat.id)
         await message.answer(reply + missed_alert, parse_mode="Markdown")
     except Exception as e:
-        await message.answer(f"❌ Ошибка ИИ-обработки голоса: {e}\n\nСкорее всего, твой OpenAI ключ заблокирован системой безопасности.")
+        await message.answer(f"❌ Ошибка ИИ-обработки голоса: {e}")
     finally:
         if os.path.exists(local_file): os.remove(local_file)
 
@@ -178,6 +194,44 @@ async def handle_telegram_webhook(request):
         print(f"Ошибка вебхука: {e}")
     return web.Response(text="OK")
 
+# ================= МИНУТНЫЙ ПРОВЕРЩИК НАПОМИНАНИЙ (CRON) =================
+async def handle_cron(request):
+    """Этот метод вызывается каждую минуту внешним будильником"""
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    url = f"{SUPABASE_URL}/rest/v1/reminders?status=eq.pending"
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(url, headers=headers)
+            if res.status_code == 200:
+                reminders = res.json()
+                now = get_now_tashkent()
+                
+                for r in reminders:
+                    # Убираем возможную букву T из таймстампа Supabase
+                    remind_str = r["remind_at"].replace("T", " ").split(".")[0]
+                    remind_time = datetime.strptime(remind_str, "%Y-%m-%d %H:%M:%S")
+                    
+                    # Если время напоминания пришло или уже слегка прошло
+                    if remind_time <= now:
+                        try:
+                            # Бот сам пишет тебе в чат!
+                            await bot.send_message(
+                                r["chat_id"], 
+                                f"⏰ *НАПОМИНАНИЕ:* \n\n{r['text']}", 
+                                parse_mode="Markdown"
+                            )
+                            # Помечаем напоминание как отправленное
+                            await client.patch(
+                                f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{r['id']}", 
+                                headers={**headers, "Content-Type": "application/json"}, 
+                                json={"status": "sent"}
+                            )
+                        except Exception as msg_err:
+                            print(f"Не удалось отправить напоминание: {msg_err}")
+    except Exception as e:
+        print(f"Ошибка в минутном кроне: {e}")
+    return web.Response(text="OK")
+
 async def on_startup_service(app):
     webhook_url = f"{os.getenv('RENDER_EXTERNAL_URL')}/webhook"
     await bot.set_webhook(webhook_url)
@@ -185,6 +239,7 @@ async def on_startup_service(app):
 def main():
     app = web.Application()
     app.router.add_post('/webhook', handle_telegram_webhook)
+    app.router.add_get('/cron', handle_cron)
     app.on_startup.append(on_startup_service)
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
