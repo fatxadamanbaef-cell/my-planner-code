@@ -6,7 +6,7 @@ import httpx
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from aiogram.types import Message, Update
 from openai import AsyncOpenAI
 
 # Ключи Telegram и Supabase
@@ -14,7 +14,7 @@ TELEGRAM_TOKEN = "8820240792:AAFXjs_djEYwPVCwqeOyM7kguSIBV2OdPYw"
 SUPABASE_URL = "https://elcmxjlqhsluzimuvdqe.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsY214amxxaHNsdXppbXV2ZHFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMjMzMzYsImV4cCI6MjA5NDU5OTMzNn0.TJQ1OGX1Wlq_hQC0DN5brBp2BCcB35KNewUy6n75VV0"
 
-# Ключь OpenAI безопасно берется из настроек Render
+# Ключ OpenAI безопасно берется из настроек Render
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -27,18 +27,25 @@ def get_now_tashkent():
 
 SYSTEM_PROMPT = """
 Ты — ультимативный ИИ-ассистент. Разбери запрос пользователя и верни ТОЛЬКО чистый JSON.
-Типы (type): 'expense', 'income', 'task', 'lesson', 'note', 'student_pay', 'student_lesson', 'reminder'.
 
-ВАЖНО: Если пользователь просит О ЧЕМ-ТО НАПОМНИТЬ в конкретное время или день (например: "напомни в 14:30...", "напомни завтра утром..."), ставь type = 'reminder'.
+Типы (type):
+- 'expense' / 'income' (расходы / доходы)
+- 'task' / 'lesson' (добавление новой задачи или нового урока в календарь)
+- 'note' (сохранение новой заметки, мысли или идеи в блокнот)
+- 'reminder' (установка напоминания на конкретное время)
+- 'student_pay' / 'student_lesson' (учёт баланса занятий учеников)
+- 'get_notes' (если пользователь просит ПОКАЗАТЬ, ВЫВЕСТИ, НАЙТИ или ПОСМОТРЕТЬ его сохраненные заметки/мысли)
+- 'get_tasks' (если пользователь просит ПОКАЗАТЬ его планы, актуальные задачи, список дел или расписание)
+- 'other' (простые вежливые фразы, приветствия, "спасибо", "отлично", не содержащие команд на запись или чтение)
 
 Формат ответа JSON:
 {
-  "type": "expense/income/task/lesson/note/student_pay/student_lesson/reminder",
+  "type": "выбранный_тип",
   "amount": число_или_null,
   "category": "категория_или_null",
-  "description": "суть действия или текст напоминания",
+  "description": "суть действия / текст заметки или напоминания",
   "date": "ГГГГ-ММ-ДД",
-  "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", // Формат строго ГГГГ-ММ-ДД ВВ:ММ:СС только для типа 'reminder'
+  "remind_at": "ГГГГ-ММ-ДД ВВ:ММ:СС или null", // Заполняй строго в этом формате только для типа 'reminder'
   "student_name": "Имя Ученика или null",
   "count": число_уроков_или_null
 }
@@ -80,7 +87,33 @@ async def save_data(data: dict, chat_id: int) -> str:
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
-            if data["type"] == "reminder":
+            # === НОВАЯ ЛОГИКА: ЧТЕНИЕ ЗАМЕТОК ИЗ БАЗЫ ===
+            if data["type"] == "get_notes":
+                res = await client.get(f"{SUPABASE_URL}/rest/v1/notes?chat_id=eq.{chat_id}", headers=headers)
+                if res.status_code == 200 and res.json():
+                    reply = "🧠 *Твой Второй Мозг (Сохраненные заметки):*\n\n"
+                    for i, note in enumerate(res.json(), 1):
+                        reply += f"{i}. {note['content']}\n"
+                    return reply
+                return "🧠 В твоем Втором Мозге пока нет заметок."
+
+            # === НОВАЯ ЛОГИКА: ЧТЕНИЕ ПЛАНОВ И ЗАДАЧ ИЗ БАЗЫ ===
+            elif data["type"] == "get_tasks":
+                res = await client.get(f"{SUPABASE_URL}/rest/v1/tasks?chat_id=eq.{chat_id}&status=eq.Новая", headers=headers)
+                if res.status_code == 200 and res.json():
+                    reply = "📌 *Твои актуальные задачи и планы:*\n\n"
+                    for t in res.json():
+                        icon = "🎓" if t["type"] == "lesson" else "📌"
+                        reply += f"{icon} [{t['due_date']}] {t['description']}\n"
+                    return reply
+                return "📌 У тебя нет невыполненных планов и задач!"
+
+            # === НОВАЯ ЛОГИКА: ОВЕТ НА ВЕЖЛИВЫЕ ФРАЗЫ ===
+            elif data["type"] == "other":
+                return "Рад помочь! 😊 Если нужно что-то записать, спланировать или напомнить — я на связи."
+
+            # === ДАЛЬШЕ СТАНДАРТНАЯ ЗАПИСЬ ДАННЫХ ===
+            elif data["type"] == "reminder":
                 payload = {"chat_id": chat_id, "text": data["description"], "remind_at": data.get("remind_at"), "status": "pending"}
                 await client.post(f"{SUPABASE_URL}/rest/v1/reminders", headers=headers, json=payload)
                 return f"🔔 *Напоминание зафиксировано!* \n📅 Время: {data.get('remind_at')}\n🎯 Суть: \"{data['description']}\""
@@ -125,7 +158,7 @@ async def save_data(data: dict, chat_id: int) -> str:
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Ультимативный ИИ-Ассистент запущен 24/7 в облаке!\n\nПросто пиши расходы, заметки или говори: *«Напомни мне в 14:30 сделать тесты»* — я сам напишу тебе в нужное время!", parse_mode="Markdown")
+    await message.answer("🚀 Ультимативный ИИ-Ассистент обновлен!\n\nТеперь ты можешь не только записывать, но и просить меня выводить информацию обычным языком. \n\nПопробуй написать:\n👉 *«Покажи мои заметки»*\n👉 *«Какие у меня планы?»*", parse_mode="Markdown")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
@@ -193,17 +226,13 @@ async def handle_telegram_webhook(request):
     return web.Response(text="OK")
 
 async def handle_keepalive_ping(request):
-    """Сюда будут стучать Google Таблицы раз в 10 минут, просто чтобы бот не спал"""
     return web.Response(text="I am awake!")
 
-# ================= ВНУТРЕННИЙ РОБОТ НАПОМИНАНИЙ (БЕЗ ВНЕШНЕГО КРОНА) =================
+# ================= ВНУТРЕННИЙ РОБОТ НАПОМИНАНИЙ =================
 async def internal_reminder_scheduler():
-    """Бесконечный цикл внутри Python, который сам проверяет базу каждые 60 секунд"""
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     url = f"{SUPABASE_URL}/rest/v1/reminders?status=eq.pending"
-    
     print("🤖 Внутренний планировщик напоминаний успешно запущен!")
-    
     while True:
         try:
             async with httpx.AsyncClient() as client:
@@ -228,19 +257,17 @@ async def internal_reminder_scheduler():
                                 print(f"Ошибка отправки сообщения: {msg_err}")
         except Exception as e:
             print(f"Ошибка проверки во внутреннем цикле: {e}")
-            
-        await asyncio.sleep(60) # Спокойно спим ровно 1 минуту внутри Python
+        await asyncio.sleep(60)
 
 async def on_startup_service(app):
     webhook_url = f"{os.getenv('RENDER_EXTERNAL_URL')}/webhook"
     await bot.set_webhook(webhook_url)
-    # Запускаем внутренний таймер прямо на старте сервера!
     asyncio.create_task(internal_reminder_scheduler())
 
 def main():
     app = web.Application()
     app.router.add_post('/webhook', handle_telegram_webhook)
-    app.router.add_get('/cron', handle_keepalive_ping) # Старый адрес теперь работает как пинг-ответчик
+    app.router.add_get('/cron', handle_keepalive_ping)
     app.on_startup.append(on_startup_service)
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
