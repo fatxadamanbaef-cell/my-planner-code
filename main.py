@@ -49,16 +49,17 @@ SYSTEM_PROMPT = """
 Текущая дата: """ + get_now_tashkent().strftime("%Y-%m-%d %H:%M:%S") + """
 
 Варианты message_type:
-1. "personal_finance" — личные расходы/доходы.
+1. "personal_finance" — личные расходы/доходы или операции очистки кассы.
 2. "crm_lesson" — работа с учениками (оплата, списание урока, изменение баланса, расписание).
 3. "insert_reminder" — создание напоминания.
 4. "analytics_request" — пользователь задает вопрос, просит отчет, хочет узнать даты, балансы, или называет одинокое имя без команды.
 
 Варианты action:
 - "expense" / "income"
+- "delete_finance" — СТРОГО если пользователь просит ОЧИСТИТЬ, УДАЛИТЬ, СТЕРЕТЬ свои расходы или доходы за день (например: "очисти расходы за сегодня", "удали траты за вчера").
 - "student_payment" / "lesson_status" / "set_balance" / "set_schedule"
 - "reminder" 
-- "delete_reminder" — если просит удалить, стереть или отменить напоминание (по имени или цифре).
+- "delete_reminder" — если просит удалить напоминание.
 
 ПРАВИЛО БЕЗОПАСНОСТИ: Если запрос не содержит явной команды на запись/удаление, а является вопросом или одиноким именем ("Давид", "Почему?", "Сколько?") -> ставь "analytics_request" и action: null.
 
@@ -66,8 +67,8 @@ SYSTEM_PROMPT = """
 {
   "is_system_action": true/false,
   "message_type": "personal_finance" | "crm_lesson" | "insert_reminder" | "analytics_request",
-  "action": "expense" | "income" | "lesson_status" | "student_payment" | "set_balance" | "set_schedule" | "reminder" | "delete_reminder" | null,
-  "finance_data": { "amount": number or null, "currency": "UZS", "category": string or null, "description": string or null },
+  "action": "expense" | "income" | "delete_finance" | "student_payment" | "lesson_status" | "set_balance" | "set_schedule" | "reminder" | "delete_reminder" | null,
+  "finance_data": { "amount": number or null, "currency": "UZS", "category": string or null, "description": string or null, "date": "YYYY-MM-DD" or null },
   "crm_data": { "student_name": string or null, "lesson_state": null, "new_datetime": null, "lessons_count": number or null, "schedule_text": string or null },
   "reminder_data": { "text": string or null, "remind_at": null },
   "chat_reply": string or null
@@ -112,8 +113,17 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
 
     async with httpx.AsyncClient() as client:
         try:
-            # === 1. ИНТЕЛЛЕКТУАЛЬНОЕ УДАЛЕНИЕ НАПОМИНАНИЙ ===
-            if action == "delete_reminder":
+            # === 1. ЛАСТИК ФИНАНСОВ (УДАЛЕНИЕ ТРАТ ЗА ДЕНЬ) ===
+            if action == "delete_finance":
+                target_date = fdata.get("date") or get_now_tashkent().strftime("%Y-%m-%d")
+                url = f"{SUPABASE_URL}/rest/v1/moneyfi_finance?chat_id=eq.{chat_id}&date=eq.{target_date}"
+                res = await client.delete(url, headers=headers)
+                if res.status_code in [200, 204]:
+                    return f"🧹 *База очищена!* Все твои финансовые записи за *{target_date}* успешно удалены из облака Moneyfi."
+                return "❌ Не удалось очистить финансовые данные в базе."
+
+            # === 2. ИНТЕЛЛЕКТУАЛЬНОЕ УДАЛЕНИЕ НАПОМИНАНИЙ ===
+            elif action == "delete_reminder":
                 res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_reminders?chat_id=eq.{chat_id}&status=eq.pending", headers=headers)
                 reminders = res.json() if res.status_code == 200 else []
                 if not reminders: return "🔔 У тебя сейчас нет активных напоминаний."
@@ -134,23 +144,23 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
                 
                 return f"🗑️ Успешно удалено из базы:\n➔ _{', '.join(deleted_texts)}_"
 
-            # === 2. СОЗДАНИЕ НАПОМИНАНИЙ ===
-            if m_type == "insert_reminder" or action == "reminder":
+            # === 3. СОЗДАНИЕ НАПОМИНАНИЙ ===
+            elif m_type == "insert_reminder" or action == "reminder":
                 if not rdata.get("remind_at"): return "❌ Укажите точное время для напоминания."
                 payload = {"chat_id": chat_id, "text": rdata.get("text"), "remind_at": rdata.get("remind_at"), "status": "pending"}
                 await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_reminders", headers=headers, json=payload)
                 return f"🔔 *Напоминание сохранено!* \n📅 Время: {payload['remind_at']}\n🎯 Суть: \"{payload['text']}\""
 
-            # === 3. ЛИЧНЫЕ ФИНАНСЫ ===
-            if m_type == "personal_finance":
+            # === 4. ЛИЧНЫЕ ФИНАНСЫ ===
+            elif m_type == "personal_finance":
                 if fdata.get("amount") is None: return "❌ Ошибка: не указана сумма транзакции."
                 amount_val = int(fdata.get("amount"))
                 payload = {"chat_id": chat_id, "action": action, "amount": amount_val, "currency": fdata.get("currency", "UZS"), "category": fdata.get("category"), "description": fdata.get("description"), "date": get_now_tashkent().strftime("%Y-%m-%d")}
                 await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_finance", headers=headers, json=payload)
                 return f"💰 *{ 'Расход' if action=='expense' else 'Доход' } записан:* {amount_val} UZS -> {payload['category']}"
 
-            # === 4. CRM СИСТЕМА УЧЕНИКОВ ===
-            if m_type == "crm_lesson":
+            # === 5. CRM СИСТЕМА УЧЕНИКОВ ===
+            elif m_type == "crm_lesson":
                 if not st_name: return "⚠️ Уточните, пожалуйста, имя ученика."
 
                 if action == "set_schedule":
@@ -203,7 +213,7 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     CONVERSATION_MEMORY[message.chat.id] = []
-    await message.answer("🚀 Moneyfi Super Assistant инициализирован. Защита БД и память включены.", reply_markup=get_main_keyboard())
+    await message.answer("🚀 Moneyfi Super Assistant инициализирован. Защита БД, ластик финансов и контекстная память активны.", reply_markup=get_main_keyboard())
 
 async def process_analytics(message: Message, query_text: str):
     await message.answer("🔄 Собираю данные...")
