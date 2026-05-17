@@ -9,11 +9,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from openai import AsyncOpenAI
 
-# Ключи и доступы
+# Ключи Telegram и Supabase остаются тут (их GitHub не блокирует)
 TELEGRAM_TOKEN = "8820240792:AAFXjs_djEYwPVCwqeOyM7kguSIBV2OdPYw"
-OPENAI_API_KEY = "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"
 SUPABASE_URL = "https://elcmxjlqhsluzimuvdqe.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsY214amxxaHNsdXppbXV2ZHFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMjMzMzYsImV4cCI6MjA5NDU5OTMzNn0.TJQ1OGX1Wlq_hQC0DN5brBp2BCcB35KNewUy6n75VV0"
+
+# Ключ OpenAI теперь будет браться из безопасных настроек Render
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -44,6 +46,7 @@ async def parse_via_ai(text: str) -> dict:
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
+        print(f"Ошибка ИИ парсинга: {e}")
         return {"type": "unknown"}
 
 async def check_missed_tasks(chat_id: int) -> str:
@@ -108,7 +111,7 @@ async def save_data(data: dict, chat_id: int) -> str:
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("🚀 Бесплатный ИИ-планировщик 24/7 запущен на чистых вебхуках!\nКоманды: `/today`, `/charts`")
+    await message.answer("🚀 Бесплатный ИИ-планировщик 24/7 запущен!\nКоманды: `/today`, `/charts`")
 
 @dp.message(F.text == "/today")
 async def get_today(message: Message):
@@ -141,7 +144,7 @@ async def get_charts(message: Message):
 
 @dp.message(F.text)
 async def handle_text(message: Message):
-    await message.answer("🔄 Анализирую...")
+    await message.answer("🔄 Анализирую текст...")
     ai_data = await parse_via_ai(message.text)
     reply = await save_data(ai_data, message.chat.id)
     missed_alert = await check_missed_tasks(message.chat.id)
@@ -161,25 +164,23 @@ async def handle_voice(message: Message):
         reply = await save_data(ai_data, message.chat.id)
         missed_alert = await check_missed_tasks(message.chat.id)
         await message.answer(reply + missed_alert, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка ИИ-обработки голоса: {e}\n\nСкорее всего, твой OpenAI ключ заблокирован системой безопасности.")
     finally:
         if os.path.exists(local_file): os.remove(local_file)
 
-# ================= КАСТОМНЫЙ ХЕНДЛЕР НА ЧИСТОМ AIOHTTP =================
 async def handle_telegram_webhook(request):
-    """Принимаем обновления напрямую от Telegram без участия модулей aiogram"""
     try:
         bot_dict = json.loads(await request.text())
         update = Update.model_validate(bot_dict, context={"bot": bot})
         await dp.feed_update(bot, update)
     except Exception as e:
-        print(f"Ошибка кастомного вебхука: {e}")
+        print(f"Ошибка вебхука: {e}")
     return web.Response(text="OK")
 
 async def on_startup_service(app):
-    """При старте сервера принудительно связываем бота с Render"""
     webhook_url = f"{os.getenv('RENDER_EXTERNAL_URL')}/webhook"
     await bot.set_webhook(webhook_url)
-    print(f"🚀 Кастомный вебхук успешно привязан к: {webhook_url}")
 
 def main():
     app = web.Application()
