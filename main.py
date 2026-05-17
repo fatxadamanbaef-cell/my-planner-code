@@ -87,7 +87,7 @@ async def generate_smart_reply(user_text: str, db_data: list) -> str:
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Ты — ИИ-ассистент топ-преподавателя математики из Ташкента. Проанализируй сырые данные из базы Supabase и развернуто ответь на вопрос пользователя. Считай суммы, группируй информацию, делай экспертные выводы. Используй красивую структуру, эмодзи и Markdown."},
+                {"role": "system", "content": "Ты — ИИ-ассистент топ-преподавателя математики из Ташкента. Проанализируй сырые данные из базы Supabase и развернуто ответь на вопрос пользователя. Считай суммы, группируй информацию. ВАЖНО: КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать Markdown-таблицы (символы '|' и строки из дефисов '---')! Они уродливо ломаются и не читаются на экранах телефонов. Вместо таблиц выводи данные красивыми вертикальными списками line-by-line. Форматируй каждую строчку лаконично, например: '🔹 *Описание* — **50 000 сум** [Категория] (Дата)'. Твой ответ должен идеально и легко читаться на узком экране мобильного телефона."},
                 {"role": "user", "content": f"Вопрос: \"{user_text}\"\n\nДанные из базы:\n{json.dumps(db_data, ensure_ascii=False, indent=2)}"}
             ]
         )
@@ -216,39 +216,36 @@ async def process_intent(ai_data: dict, chat_id: int, original_text: str) -> str
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "🚀 Пульт управления активирован!\n\nИспользуй удобные кнопки главного меню ниже, чтобы мгновенно просматривать отчёты и балансы 👇",
+        "🚀 Мобильный пульт управления активирован!\n\nИспользуй кнопки ниже. Все отчёты адаптированы под экраны телефонов 👇",
         reply_markup=get_main_keyboard()
     )
 
-# ========================================================
-# УМНЫЕ ОБРАБОТЧИКИ НАЖАТИЙ НА КНОПКИ (БЕЗ ЛИШНЕГО ПАРСИНГА)
-# ========================================================
 @dp.message(F.text == "📉 Показать расходы")
 async def btn_expenses(message: Message):
-    await message.answer("🔄 Анализирую расходы...")
+    await message.answer("🔄 Загружаю историю расходов...")
     ai_data = {"intent": "read_finance", "params": {"description": "expense"}}
-    reply = await process_intent(ai_data, message.chat.id, message.text)
+    reply = await process_intent(ai_data, message.chat.id, "Покажи список моих расходов за последнее время построчно")
     await message.answer(reply, parse_mode="Markdown")
 
 @dp.message(F.text == "🪙 Показать доходы")
 async def btn_incomes(message: Message):
-    await message.answer("🔄 Анализирую доходы...")
+    await message.answer("🔄 Загружаю историю доходов...")
     ai_data = {"intent": "read_finance", "params": {"description": "income"}}
-    reply = await process_intent(ai_data, message.chat.id, message.text)
+    reply = await process_intent(ai_data, message.chat.id, "Покажи список моих доходов построчно")
     await message.answer(reply, parse_mode="Markdown")
 
 @dp.message(F.text == "🎓 Баланс учеников")
 async def btn_balances(message: Message):
     await message.answer("🔄 Проверяю остатки занятий...")
     ai_data = {"intent": "read_students", "params": {}}
-    reply = await process_intent(ai_data, message.chat.id, "Покажи баланс всех моих учеников и напомни, когда были последние изменения")
+    reply = await process_intent(ai_data, message.chat.id, "Выведи аккуратным вертикальным списком баланс моих учеников: сколько уроков осталось у каждого")
     await message.answer(reply, parse_mode="Markdown")
 
 @dp.message(F.text == "🔔 Напоминания")
 async def btn_reminders(message: Message):
     await message.answer("🔄 Загружаю активные напоминания...")
     ai_data = {"intent": "read_reminders", "params": {}}
-    reply = await process_intent(ai_data, message.chat.id, message.text)
+    reply = await process_intent(ai_data, message.chat.id, "Выведи список моих напоминаний списком")
     await message.answer(reply, parse_mode="Markdown")
 
 @dp.message(F.text == "📅 Расписание")
