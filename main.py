@@ -35,7 +35,6 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def get_student_inline_keyboard(student_name: str):
-    """Создает интерактивные кнопки календаря посещаемости под карточкой ученика"""
     kb = [
         [
             InlineKeyboardButton(text="✅ Проведен", callback_data=f"crm:conducted:{student_name}"),
@@ -54,7 +53,7 @@ def add_to_memory(chat_id: int, role: str, content: str):
 
 # ================= СИСТЕМНЫЕ ПРОМПТЫ =================
 SYSTEM_PROMPT = """
-Ты — Moneyfi Super Assistant, гибрид быстрого трекера личных финансов и умной CRM для преподавателя.
+Ты — Moneyfi Super Assistant, гибрид быстрого трекера личных финансов и умной CRM.
 Разбери запрос пользователя и верни СТРОГИЙ JSON. Никаких рассуждений вне JSON структуры!
 
 Текущая дата: """ + get_now_tashkent().strftime("%Y-%m-%d %H:%M:%S") + """
@@ -78,7 +77,7 @@ SYSTEM_PROMPT = """
   "message_type": "personal_finance" | "crm_lesson" | "insert_reminder" | "analytics_request",
   "action": "expense" | "income" | "delete_finance" | "student_payment" | "lesson_status" | "set_balance" | "set_schedule" | "reminder" | "delete_reminder" | null,
   "finance_data": { "amount": number or null, "currency": "UZS", "category": string or null, "description": string or null, "date": "YYYY-MM-DD" or null },
-  "crm_data": { "student_name": string or null, "lesson_state": "conducted" | "rescheduled" | "canceled" | null, "new_datetime": null, "lessons_count": number or null, "schedule_text": string or null },
+  "crm_data": { "student_name": string or null, "lesson_state": "conducted" | "rescheduled" | "canceled" | null, "new_datetime": "YYYY-MM-DDTHH:MM" or null, "lessons_count": number or null, "schedule_text": string or null },
   "reminder_data": { "text": string or null, "remind_at": null },
   "chat_reply": string or null
 }
@@ -169,18 +168,24 @@ async def handle_moneyfi_action(data: dict, chat_id: int, original_text: str) ->
 
                 elif action == "lesson_status":
                     l_state = cdata.get("lesson_state") or "conducted"
-                    await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_crm_lessons", headers=headers, json={"chat_id": chat_id, "student_name": st_name, "lesson_state": l_state})
+                    # Если дата пришла из голоса - берем её. Если нет - берем текущую.
+                    target_date = cdata.get("new_datetime") or get_now_tashkent().isoformat()
+                    
+                    await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_crm_lessons", headers=headers, json={"chat_id": chat_id, "student_name": st_name, "lesson_state": l_state, "new_datetime": target_date})
+                    
+                    date_str = target_date[:10] if "T" in target_date else target_date
+                    
                     if l_state in ["conducted", "skipped"]:
                         st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{st_name}", headers=headers)
                         if st_res.json():
                             new_bal = max(0, st_res.json()[0]["balance_lessons"] - 1)
                             await client.patch(f"{SUPABASE_URL}/rest/v1/moneyfi_students?id=eq.{st_res.json()[0]['id']}", headers=headers, json={"balance_lessons": new_bal})
-                            return f"📉 *CRM:* Урок у *{st_name}* зафиксирован ({'Проведен' if l_state=='conducted' else 'Прогул'}). Списан 1 урок. Остаток: {new_bal} уроков."
-                    return f"📅 Статус урока *{st_name}* изменен на Отмену."
+                            return f"📉 Урок у *{st_name}* за {date_str} списан. Остаток: {new_bal} уроков."
+                    return f"📅 Статус урока *{st_name}* за {date_str} обновлен на Отмену."
 
                 elif action == "set_balance":
                     count = cdata.get("lessons_count")
-                    if count is None: return "❌ Укажите точную цифру для нового баланса."
+                    if count is None: return "❌ Ошибка: Укажите точную цифру для нового баланса."
                     st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{st_name}", headers=headers)
                     if st_res.json(): await client.patch(f"{SUPABASE_URL}/rest/v1/moneyfi_students?id=eq.{st_res.json()[0]['id']}", headers=headers, json={"balance_lessons": int(count)})
                     else: await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_students", headers=headers, json={"chat_id": chat_id, "name": st_name, "balance_lessons": int(count)})
@@ -200,8 +205,13 @@ async def handle_crm_callback(callback: CallbackQuery):
     states_ru = {"conducted": "Проведен ✅", "skipped": "Прогул (списание) ❌", "canceled": "Отмена (уважительная) ⏸️"}
     await callback.answer(f"Фиксирую: {states_ru[state]}")
     
+    now_tashkent = get_now_tashkent()
+    today_str = now_tashkent.strftime("%d.%m.%Y")
+    iso_date = now_tashkent.isoformat()
+    
     async with httpx.AsyncClient() as client:
-        await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_crm_lessons", headers=headers, json={"chat_id": chat_id, "student_name": student_name, "lesson_state": state})
+        # Пишем в базу ТОЧНУЮ дату нажатия кнопки (сегодня)
+        await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_crm_lessons", headers=headers, json={"chat_id": chat_id, "student_name": student_name, "lesson_state": state, "new_datetime": iso_date})
         
         if state in ["conducted", "skipped"]:
             st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{student_name}", headers=headers)
@@ -217,7 +227,7 @@ async def handle_crm_callback(callback: CallbackQuery):
                     f"🏷 Имя: {student_name}\n"
                     f"📉 Остаток занятий: {new_bal} уроков {alert}\n"
                     f"📅 Расписание: {old_sched}\n\n"
-                    f"⚡️ *Статус изменен:* Урок успешно отмечен как **{states_ru[state]}**!"
+                    f"⚡️ *Статус изменен:* Урок за **{today_str}** успешно отмечен как **{states_ru[state]}**!"
                 )
                 await callback.message.edit_text(updated_text, reply_markup=get_student_inline_keyboard(student_name), parse_mode="Markdown")
                 return
@@ -231,7 +241,7 @@ async def handle_crm_callback(callback: CallbackQuery):
             f"🏷 Имя: {student_name}\n"
             f"📉 Остаток занятий: {curr_bal} уроков\n"
             f"📅 Расписание: {curr_sched}\n\n"
-            f"⚡️ *Статус изменен:* Урок отмечен как **{states_ru[state]}** (баланс сохранен)."
+            f"⚡️ *Статус изменен:* Урок за **{today_str}** отмечен как **{states_ru[state]}** (баланс сохранен)."
         )
         await callback.message.edit_text(updated_text, reply_markup=get_student_inline_keyboard(student_name), parse_mode="Markdown")
 
@@ -239,7 +249,7 @@ async def handle_crm_callback(callback: CallbackQuery):
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     CONVERSATION_MEMORY[message.chat.id] = []
-    await message.answer("Привет, Farxad! 🚀 \nЯ — **Moneyfi Super Assistant**.\nИнтерактивный календарь-пульт для уроков и трекер финансов запущены.", reply_markup=get_main_keyboard())
+    await message.answer("Привет, Farxad! 🚀 \nЯ — **Moneyfi Super Assistant**.\nИнтерактивный календарь с фиксацией дат запущен.", reply_markup=get_main_keyboard())
 
 async def process_analytics(message: Message, query_text: str):
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -263,7 +273,6 @@ async def btn_incomes(message: Message):
     reply = await generate_smart_reply("Покажи список моих доходов построчно.", db_data, message.chat.id)
     await message.answer(reply, parse_mode="Markdown")
 
-# ИНТЕРАКТИВНЫЙ ВЫВОД КАРТОЧЕК УЧЕНИКОВ С КНОПКАМИ ПОСЕЩАЕМОСТИ
 @dp.message(F.text == "🎓 CRM: Ученики")
 async def btn_crm(message: Message):
     await message.answer("🔄 Загружаю интерактивный календарь студентов...")
@@ -273,7 +282,7 @@ async def btn_crm(message: Message):
         students = res.json() if res.status_code == 200 else []
         if not students: return await message.answer("🎓 Учеников в базе данных пока нет. Надиктуйте: 'Добавь ученика Давида, баланс 4 урока'.")
         for st in students:
-            card_text = f"👤 **Профиль ученика**\n\n🏷 Имя: {st['name']}\n📉 Остаток занятий: {st['balance_lessons']} уроков\n📅 Расписание: {st.get('schedule', 'Не задано')}\n\n📝 *Отметить посещаемость текущего урока:* "
+            card_text = f"👤 **Профиль ученика**\n\n🏷 Имя: {st['name']}\n📉 Остаток занятий: {st['balance_lessons']} уроков\n📅 Расписание: {st.get('schedule', 'Не задано')}\n\n📝 *Отметить посещаемость ТЕКУЩЕГО урока:* "
             await message.answer(card_text, reply_markup=get_student_inline_keyboard(st['name']), parse_mode="Markdown")
 
 @dp.message(F.text == "🔔 Напоминания")
@@ -342,7 +351,6 @@ async def handle_telegram_webhook(request):
 
 async def handle_keepalive_ping(request): return web.Response(text="I am awake!")
 
-# ================= ФОНОВЫЙ ПЛАНОВИК ДЕДЛАЙНОВ =================
 async def internal_reminder_scheduler():
     global LAST_EXPENSE_PROMPT_DATE
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
