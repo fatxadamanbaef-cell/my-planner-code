@@ -201,10 +201,8 @@ async def handle_crm_callback(callback: CallbackQuery):
     await callback.answer(f"Фиксирую: {states_ru[state]}")
     
     async with httpx.AsyncClient() as client:
-        # Записываем событие в журнал посещаемости
         await client.post(f"{SUPABASE_URL}/rest/v1/moneyfi_crm_lessons", headers=headers, json={"chat_id": chat_id, "student_name": student_name, "lesson_state": state})
         
-        # Если проведен или прогул — списываем баланс уроков
         if state in ["conducted", "skipped"]:
             st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{student_name}", headers=headers)
             if st_res.json():
@@ -213,7 +211,6 @@ async def handle_crm_callback(callback: CallbackQuery):
                 new_bal = max(0, old_bal - 1)
                 await client.patch(f"{SUPABASE_URL}/rest/v1/moneyfi_students?id=eq.{st_res.json()[0]['id']}", headers=headers, json={"balance_lessons": new_bal})
                 
-                # Красиво обновляем карточку ученика прямо в чате на лету!
                 alert = "\n⚠️ *БАЛАНС НА НУЛЕ! Нужно обновить оплату.*" if new_bal == 0 else ""
                 updated_text = (
                     f"👤 **Профиль ученика**\n\n"
@@ -225,7 +222,6 @@ async def handle_crm_callback(callback: CallbackQuery):
                 await callback.message.edit_text(updated_text, reply_markup=get_student_inline_keyboard(student_name), parse_mode="Markdown")
                 return
         
-        # Если это просто уважительная отмена без списания денег
         st_res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?name=eq.{student_name}", headers=headers)
         curr_bal = st_res.json()[0]["balance_lessons"] if st_res.json() else 0
         curr_sched = st_res.json()[0].get("schedule", "Не задано") if st_res.json() else "Не задано"
@@ -275,18 +271,9 @@ async def btn_crm(message: Message):
     async with httpx.AsyncClient() as client:
         res = await client.get(f"{SUPABASE_URL}/rest/v1/moneyfi_students?chat_id=eq.{message.chat.id}", headers=headers)
         students = res.json() if res.status_code == 200 else []
-        
-        if not students:
-            return await message.answer("🎓 Учеников в базе данных пока нет. Надиктуйте: 'Добавь ученика Давида, баланс 4 урока'.")
-        
+        if not students: return await message.answer("🎓 Учеников в базе данных пока нет. Надиктуйте: 'Добавь ученика Давида, баланс 4 урока'.")
         for st in students:
-            card_text = (
-                f"👤 **Профиль ученика**\n\n"
-                f"🏷 Имя: {st['name']}\n"
-                f"📉 Остаток занятий: {st['balance_lessons']} уроков\n"
-                f"📅 Расписание: {st.get('schedule', 'Не задано')}\n\n"
-                f"📝 *Отметить посещаемость текущего урока:* "
-            )
+            card_text = f"👤 **Профиль ученика**\n\n🏷 Имя: {st['name']}\n📉 Остаток занятий: {st['balance_lessons']} уроков\n📅 Расписание: {st.get('schedule', 'Не задано')}\n\n📝 *Отметить посещаемость текущего урока:* "
             await message.answer(card_text, reply_markup=get_student_inline_keyboard(st['name']), parse_mode="Markdown")
 
 @dp.message(F.text == "🔔 Напоминания")
@@ -343,6 +330,17 @@ async def handle_voice(message: Message):
         await message.answer(f"❌ Ошибка голоса: {e}")
     finally:
         if os.path.exists(local_file): os.remove(local_file)
+
+# ================= ВЕБХУКИ И ФОНОВЫЕ ЗАДАЧИ =================
+async def handle_telegram_webhook(request):
+    try:
+        bot_dict = json.loads(await request.text())
+        update = Update.model_validate(bot_dict, context={"bot": bot})
+        await dp.feed_update(bot, update)
+    except Exception as e: print(f"Webhook error: {e}")
+    return web.Response(text="OK")
+
+async def handle_keepalive_ping(request): return web.Response(text="I am awake!")
 
 # ================= ФОНОВЫЙ ПЛАНОВИК ДЕДЛАЙНОВ =================
 async def internal_reminder_scheduler():
